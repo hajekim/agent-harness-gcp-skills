@@ -103,17 +103,17 @@ Apigee API Hub    → Enterprise API management at scale
 - `A2A`: agent ↔ agent (open standard led by Google)
 
 ### Layer 5: Memory (State Persistence)
-```python
+```
 # Development / testing
-InMemorySessionService  # Lost on instance restart
+InMemorySessionService       — lost on instance restart
 
 # Production (built into Agent Engine)
-Agent Engine Sessions   # Short-term memory — conversation history within a session
-Memory Bank             # Long-term memory — knowledge shared across sessions
+Agent Engine Sessions        — short-term memory (conversation history within a session)
+Memory Bank                  — long-term memory (knowledge shared across sessions)
 
 # ZDR (Zero-Downtime Resilience)
-RalphLoopManager.save_state()   # Persists intermediate state to a JSON file
-RalphLoopManager.load_state()   # Rehydrates state on restart
+RalphLoopManager.save_state()   — persists intermediate state to a JSON file
+RalphLoopManager.load_state()   — rehydrates state on container restart
 ```
 
 **Core principle**: In production, always use **Stateless Agent Application + External State Store** — any instance must be able to handle any request.

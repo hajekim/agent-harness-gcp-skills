@@ -172,6 +172,7 @@ def execute_shell(command: str, tool_context) -> str:
 @global_policy.interception_wrapper
 def execute_shell(command: str) -> str:
     # ... execute
+    pass
 ```
 
 Policy Engine blocks → retry signal sent to Worker → Backpressure loop activates
