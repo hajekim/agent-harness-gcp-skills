@@ -19,10 +19,10 @@ Related extensions: [`mcp-toolbox`](https://github.com/gemini-cli-extensions/mcp
 | Service | Environment | Notes |
 |---------|-------------|-------|
 | `InMemorySessionService` | Local dev / testing | Lost on restart — never use in production |
-| `DatabaseSessionService` (Cloud SQL) | Production | ADK-native, horizontally scalable |
+| `DatabaseSessionService` (Cloud SQL / AlloyDB) | Production | ADK-native via `google.adk.sessions.DatabaseSessionService` |
 | `VertexAiSessionService` | Agent Engine (built-in) | Zero-config when deployed to Agent Engine |
-| Firestore | Production (serverless) | Auto-scaling, no connection pool management |
-| Memorystore (Redis) | Production (low-latency) | Sub-millisecond reads, ideal for high-frequency state updates |
+| Firestore | Not ADK-native | No official ADK `SessionService` adapter — requires a custom wrapper around `google-cloud-firestore` |
+| Memorystore (Redis) | Not ADK-native | No official ADK `SessionService` adapter — requires a custom wrapper around `redis-py` |
 
 ### DatabaseSessionService with Cloud SQL (Production Standard)
 
@@ -164,6 +164,12 @@ import os
 from dataclasses import dataclass, asdict
 from typing import Optional
 
+# LoopState is defined here as a typed dataclass for use with the JSON-file ZDR backend.
+# ralph_loop_gcp.md §3 shows RalphLoopManager with a plain dict interface —
+# that is the GCS-backed production variant. Choose one consistently:
+#   - Local dev / JSON file → use this dataclass
+#   - Production / GCS     → see ralph_loop_gcp.md §3 (plain dict + GCS)
+
 @dataclass
 class LoopState:
     session_id: str
@@ -212,26 +218,37 @@ def run_loop(session_id: str, tasks: list[str]) -> None:
         session_id=session_id,
         current_task_index=0,
         completed_tasks=[],
+        last_result=None,
+        iteration_count=0,
     )
+
+    # Guard: all tasks already completed (e.g. restarted after last task)
+    if state.current_task_index >= len(tasks):
+        return
+
+    current_task = tasks[state.current_task_index]
 
     # Inject past memory into the Planner's context
-    past_knowledge = search_memory(
-        query=tasks[state.current_task_index],
-        session_id=session_id
-    )
+    past_knowledge = search_memory(query=current_task, session_id=session_id)
 
     # Execute one task (ADK LoopAgent handles the Planner→Worker→Checker cycle)
+    # runner.run_async() drives the Planner→Worker→Checker pipeline;
+    # the Worker writes its output to state["execution_result"] in ADK State.
+    # Extract the result after the runner completes and store in LoopState:
+    #   state.last_result = adk_session.state.get("execution_result", {}).get("result", "")
     # ... (ADK runner invocation)
 
     # Persist after successful completion
-    state.completed_tasks.append(tasks[state.current_task_index])
+    completed_task = tasks[state.current_task_index]   # capture before incrementing
+    state.completed_tasks.append(completed_task)
     state.current_task_index += 1
     state.iteration_count += 1
     manager.save_state(state)
 
     # Store result in long-term Memory Bank
+    # state.last_result must be set from the ADK runner output before this call
     add_memory(
-        content=f"Completed: {tasks[state.current_task_index - 1]}\nResult: {state.last_result}",
+        content=f"Completed: {completed_task}\nResult: {state.last_result or '(no result recorded)'}",
         session_id=session_id
     )
 ```

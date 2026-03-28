@@ -143,10 +143,22 @@ def evaluate_case(harness: ModelHarness, case: dict) -> dict:
             failures.append(f"Contains forbidden content: '{forbidden}'")
 
     # Structured output validation (AgentResponse fields)
-    for field in case.get("expected_structure", []):
-        if field not in response.lower():
-            passed = False
-            failures.append(f"Missing expected field in response: '{field}'")
+    # Try JSON parse first — ModelHarness.generate() returns structured JSON.
+    # Fall back to substring check if the response is plain text (generate_safe path).
+    expected_fields = case.get("expected_structure", [])
+    if expected_fields:
+        try:
+            response_json = json.loads(response)
+            for field in expected_fields:
+                if field not in response_json:
+                    passed = False
+                    failures.append(f"Missing field in JSON response: '{field}'")
+        except (json.JSONDecodeError, TypeError):
+            # Response is not JSON — fall back to substring presence check
+            for field in expected_fields:
+                if field not in response.lower():
+                    passed = False
+                    failures.append(f"Missing expected field in response: '{field}'")
 
     # Latency check
     max_latency = case.get("max_latency_seconds", 60)
@@ -568,32 +580,68 @@ class TestSearchWeb:
 
 ```python
 # tests/test_state_tools.py
+# The actual implementation (adk_patterns.md §9) uses:
+#   async with sse_client(MCP_TOOLBOX_URL) as (read, write):
+#       async with ClientSession(read, write) as session:
+#           await session.initialize()
+#           result = await session.call_tool(...)
+# Mock the sse_client transport, NOT a non-existent MCPToolboxClient.
 import pytest
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 from tools.state_tools import get_task_state, update_task_state
 
 
 class TestStateTool:
-    @patch("tools.state_tools.MCPToolboxClient")
+    @patch("tools.state_tools.sse_client")
     @pytest.mark.asyncio
-    async def test_get_task_state_calls_mcp(self, mock_client_cls, mock_tool_context):
-        mock_client = AsyncMock()
-        mock_client.call_tool.return_value = '{"status": "in_progress"}'
-        mock_client_cls.return_value.__aenter__.return_value = mock_client
+    async def test_get_task_state_calls_mcp(self, mock_sse_client, mock_tool_context):
+        # Simulate: async with sse_client(...) as (read, write)
+        mock_read, mock_write = AsyncMock(), AsyncMock()
+        mock_sse_client.return_value.__aenter__.return_value = (mock_read, mock_write)
+        mock_sse_client.return_value.__aexit__ = AsyncMock(return_value=False)
 
-        result = await get_task_state("session-abc", mock_tool_context)
+        # Simulate: async with ClientSession(read, write) as session
+        mock_session = AsyncMock()
+        mock_session.call_tool.return_value = MagicMock(
+            __str__=lambda self: '{"status": "in_progress"}'
+        )
+
+        with patch("tools.state_tools.ClientSession") as mock_session_cls:
+            mock_session_cls.return_value.__aenter__.return_value = mock_session
+            mock_session_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await get_task_state("session-abc", mock_tool_context)
+
         assert "in_progress" in result
+        mock_session.initialize.assert_called_once()
+        mock_session.call_tool.assert_called_once_with(
+            "get-task-state", {"session_id": "session-abc"}
+        )
 
-    @patch("tools.state_tools.MCPToolboxClient")
+    @patch("tools.state_tools.sse_client")
     @pytest.mark.asyncio
-    async def test_update_task_state_writes_status(self, mock_client_cls, mock_tool_context):
-        mock_client = AsyncMock()
-        mock_client.call_tool.return_value = "ok"
-        mock_client_cls.return_value.__aenter__.return_value = mock_client
+    async def test_update_task_state_writes_status(self, mock_sse_client, mock_tool_context):
+        mock_read, mock_write = AsyncMock(), AsyncMock()
+        mock_sse_client.return_value.__aenter__.return_value = (mock_read, mock_write)
+        mock_sse_client.return_value.__aexit__ = AsyncMock(return_value=False)
 
-        result = await update_task_state("session-abc", "task-1", "completed", "done", mock_tool_context)
+        mock_session = AsyncMock()
+        mock_session.call_tool.return_value = MagicMock()
+
+        with patch("tools.state_tools.ClientSession") as mock_session_cls:
+            mock_session_cls.return_value.__aenter__.return_value = mock_session
+            mock_session_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await update_task_state(
+                "session-abc", "task-1", "completed", "done", mock_tool_context
+            )
+
         assert result is not None
-        mock_client.call_tool.assert_called_once()
+        mock_session.call_tool.assert_called_once_with(
+            "update-task-state",
+            {"session_id": "session-abc", "task_id": "task-1",
+             "status": "completed", "result": "done"},
+        )
 ```
 
 ---
@@ -621,6 +669,6 @@ pytest tests/ --cov=tools --cov-report=term-missing
 - [ ] `pytest`, `pytest-asyncio`, and `pytest-cov` installed via `pip install -e ".[dev]"`
 - [ ] `mock_tool_context` fixture defined in `tests/conftest.py`
 - [ ] `tests/test_<tool>.py` file exists for every tool function
-- [ ] External API calls (`Discovery Engine`, `genai`, `MCPToolboxClient`) isolated with `unittest.mock.patch`
+- [ ] External API calls (`Discovery Engine`, `genai`, `sse_client`/`ClientSession`) isolated with `unittest.mock.patch`
 - [ ] `PolicyEngine` tests include both allow and block cases
 - [ ] `pytest tests/` passes identically locally and in Cloud Build Step 1

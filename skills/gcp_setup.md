@@ -57,6 +57,7 @@ gcloud services enable \
   iam.googleapis.com \
   modelarmor.googleapis.com \
   cloudscheduler.googleapis.com \
+  discoveryengine.googleapis.com \
   --project=$PROJECT_ID
 ```
 
@@ -81,6 +82,7 @@ gemini "enable all APIs required for an Agent Harness on GCP: Vertex AI, Cloud R
 | `iam.googleapis.com` | Service accounts, per-agent identities |
 | `modelarmor.googleapis.com` | Model Armor input/output inspection (prompt injection defense) |
 | `cloudscheduler.googleapis.com` | External trigger for production Ralph Loop |
+| `discoveryengine.googleapis.com` | Vertex AI Search — required for RAG/Grounding (see `adk_patterns.md §10`) |
 
 ---
 
@@ -281,7 +283,7 @@ opentelemetry-instrumentation                 # Auto-instrumentation support
 # pyproject.toml
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-harness"

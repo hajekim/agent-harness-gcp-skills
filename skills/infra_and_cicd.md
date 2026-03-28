@@ -159,10 +159,12 @@ pip install google-adk --quiet
 # 2. Use ADK's internal packager to create a deployable archive
 #    This generates the agent_engine_app.py wrapper and bundles dependencies
 # ⚠️ Agent Engine is only available in us-central1. $REGION must be us-central1.
+# ⚠️ --region must be us-central1 (Agent Engine only supports us-central1)
+# ⚠️ --dry-run: build artifact only, do not deploy
 adk deploy agent_engine agents/ \
   --project $PROJECT_ID \
-  --region $REGION \               # must be us-central1
-  --dry-run \                      # build artifact only, do not deploy
+  --region $REGION \
+  --dry-run \
   --output-dir infra/
 
 # 3. The ADK packager produces source.tar.gz in the output directory

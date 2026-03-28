@@ -112,8 +112,10 @@ Agent Engine Sessions        — short-term memory (conversation history within 
 Memory Bank                  — long-term memory (knowledge shared across sessions)
 
 # ZDR (Zero-Downtime Resilience)
-RalphLoopManager.save_state()   — persists intermediate state to a JSON file
-RalphLoopManager.load_state()   — rehydrates state on container restart
+RalphLoopManager.save_state()   — persists intermediate state to GCS (production)
+RalphLoopManager.load_state()   — rehydrates state on container restart from GCS
+# Note: JSON file backend is used for local dev only (Cloud Run has no persistent local storage)
+# See ralph_loop_gcp.md §3 for the GCS-backed production implementation
 ```
 
 **Core principle**: In production, always use **Stateless Agent Application + External State Store** — any instance must be able to handle any request.
@@ -393,7 +395,7 @@ coordinator = Agent(
 root_agent = coordinator
 ```
 
-Each specialist agent is independently deployed to Cloud Run and declares its capabilities via `/.well-known/agent.json` (AgentCard). See `adk_patterns.md` Section 10 for the full implementation pattern.
+Each specialist agent is independently deployed to Cloud Run and declares its capabilities via `/.well-known/agent.json` (AgentCard). See `adk_patterns.md §11` for the full A2A implementation pattern (AgentCard, JSON-RPC call, IAM setup).
 
 ---
 

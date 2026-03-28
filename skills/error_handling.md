@@ -29,6 +29,7 @@ The standard pattern for any tool function: validate → execute → catch → r
 
 ```python
 # tools/base_tool.py
+import asyncio
 import time
 import logging
 from functools import wraps
@@ -39,8 +40,12 @@ logger = logging.getLogger(__name__)
 
 def with_retry(max_attempts: int = 3, backoff_seconds: float = 2.0):
     """
-    Decorator: retries a tool function with exponential backoff on transient errors.
+    Decorator: retries a **synchronous** tool function with exponential backoff.
     Does NOT retry on PolicyEngine violations or permanent errors.
+
+    Use `async_with_retry` for `async def` tool functions (I/O-bound, MCP calls, etc.).
+    Applying this decorator to an async function will NOT work — it returns a coroutine
+    object instead of awaiting it.
     """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
@@ -65,12 +70,45 @@ def with_retry(max_attempts: int = 3, backoff_seconds: float = 2.0):
             raise last_error
         return wrapper
     return decorator
+
+
+def async_with_retry(max_attempts: int = 3, backoff_seconds: float = 2.0):
+    """
+    Decorator: retries an **async** tool function with exponential backoff.
+    Use for `async def` tools (MCP calls, A2A calls, async DB queries, etc.).
+
+    Example:
+        @async_with_retry(max_attempts=3, backoff_seconds=1.5)
+        async def call_remote_mcp(...): ...
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except PermissionError:
+                    raise
+                except Exception as e:
+                    last_error = e
+                    wait = backoff_seconds * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"[{func.__name__}] attempt {attempt}/{max_attempts} failed: {e}. "
+                        f"Retrying in {wait:.1f}s..."
+                    )
+                    if attempt < max_attempts:
+                        await asyncio.sleep(wait)   # non-blocking sleep
+            logger.error(f"[{func.__name__}] all {max_attempts} attempts failed.")
+            raise last_error
+        return wrapper
+    return decorator
 ```
 
 ### Apply to any tool:
 
 ```python
-# tools/grounding.py
+# tools/grounding.py — sync tool
 from tools.base_tool import with_retry
 from google.adk.tools import ToolContext
 
@@ -80,6 +118,16 @@ def search_knowledge_base(query: str, tool_context: ToolContext) -> str:
     Searches the enterprise knowledge base (RAG).
     Retries automatically on transient network errors.
     """
+    # ... implementation
+    pass
+
+
+# tools/mcp_client.py — async tool (I/O-bound: use async_with_retry)
+from tools.base_tool import async_with_retry
+
+@async_with_retry(max_attempts=3, backoff_seconds=1.5)
+async def call_remote_mcp_safe(tool_name: str, arguments: dict, tool_context: ToolContext) -> str:
+    """Calls a Remote MCP tool with automatic async retry."""
     # ... implementation
     pass
 ```
@@ -689,21 +737,34 @@ def search_knowledge_base(query: str, tool_context) -> list[str]:
 
 ### Tracing Loop Iterations via ADK Callbacks
 
+> **Important**: Spans must be tracked in a **module-level dict**, not in ADK State.
+> ADK State is serialized to JSON for persistence — OpenTelemetry Span objects are not JSON-serializable.
+> `tracer.start_span()` returns a Span; call `span.end()` explicitly in `after_model_callback`.
+
 ```python
 # agents/callbacks.py — add span to before_model_callback
+from __future__ import annotations
+from typing import Any
 from agents.observability import logger, tracer
 from opentelemetry import trace as otel_trace
+
+# Module-level registry for active spans.
+# Key: "{session_id}.{agent_name}" — uniquely identifies each concurrent LLM call.
+# Never store Span objects in ADK State (not JSON-serializable).
+_active_spans: dict[str, Any] = {}
+
 
 def before_model_callback(callback_context, llm_request):
     """Model Armor input check + start iteration trace span."""
     session_id = callback_context.state.get("session:id", "unknown")
     iteration  = callback_context.state.get("session:iteration", 0)
 
-    # Start trace span — closed in after_model_callback
+    # Start span and store in module-level dict (NOT in ADK state)
+    span_key = f"{session_id}.{callback_context.agent_name}"
     span = tracer.start_span(f"llm_call.iteration_{iteration}")
     span.set_attribute("session_id", session_id)
     span.set_attribute("agent_name", callback_context.agent_name)
-    callback_context.state["session:current_span_ctx"] = otel_trace.use_span(span)
+    _active_spans[span_key] = span   # ← module-level dict, not callback_context.state
 
     logger.info(
         "LLM call started",
@@ -718,13 +779,19 @@ def before_model_callback(callback_context, llm_request):
 
 
 def after_model_callback(callback_context, llm_response):
-    """Model Armor output check + close span."""
+    """Model Armor output check + explicitly end the trace span."""
     session_id = callback_context.state.get("session:id", "unknown")
+    span_key = f"{session_id}.{callback_context.agent_name}"
+
+    # Retrieve and end the span started in before_model_callback
+    span = _active_spans.pop(span_key, None)
+    if span:
+        span.end()   # ← explicit end — spans do NOT close themselves
+
     logger.info(
         "LLM call completed",
         extra={"extra_fields": {"session_id": session_id}},
     )
-    # Span closed automatically (handled by context manager)
     return None
 ```
 
@@ -964,4 +1031,5 @@ env {
 - [ ] `acquire_flash_quota()` called in `before_model_callback` for ADK agents
 - [ ] Monitor `ResourceExhausted` errors in Cloud Logging — reduce RPM limits if spikes persist
 - [ ] For Cloud Run scaled-out deployments: set limits per **instance** (not total) to avoid over-throttling
+- [ ] Same applies to **Vertex AI Agent Engine**: Agent Engine also scales instances horizontally. The `flash_limiter`/`pro_limiter` singletons are per-process — each instance has its own bucket. Set RPM limits accordingly (e.g. `total_quota / expected_instance_count`).
 - [ ] Regularly check per-session token usage with the `observability` extension

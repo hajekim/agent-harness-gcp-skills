@@ -279,9 +279,9 @@ The infrastructure deployment region (`us-central1`) and the model endpoint (`gl
 
 ---
 
-### ⚠️ Model ID Placeholder Note
+### Model ID Reference
 
-The model IDs used throughout these Skills (`gemini-3-flash-preview`, `gemini-3-pro-preview`) are **conceptual placeholders**. Before deploying to production, always verify the currently available IDs in the Vertex AI model catalog.
+The model IDs used throughout these Skills (`gemini-3-flash-preview`, `gemini-3-pro-preview`) are real Vertex AI model IDs available on the global endpoint. Verify currently available IDs at any time:
 
 ```bash
 # List currently available Gemini model IDs
@@ -301,16 +301,19 @@ for m in client.models.list():
 
 Model ID naming conventions (Vertex AI):
 ```
-# Latest stable version (automatically tracks the latest minor version)
+# Preview (latest capability, may change)
+gemini-3-flash-preview
+gemini-3-pro-preview
+
+# Stable (auto-tracks latest minor version within the generation)
 gemini-2.5-flash
 gemini-2.5-pro
 
-# Pinned to a specific version (guarantees production reproducibility)
+# Pinned (guarantees production reproducibility — recommended for evals)
 gemini-2.5-flash-001
-gemini-2.5-pro-preview-05-06
 ```
 
-> **Recommendation**: The principle of using `flash` for cost-sensitive Workers and `pro` series for Planners requiring complex reasoning remains the same. Just replace the actual model IDs with those from the catalog.
+> **Production recommendation**: Use `gemini-3-flash-preview` / `gemini-3-pro-preview` during development for latest capabilities. For production deployments where reproducibility matters, pin to a specific version (e.g. `gemini-2.5-flash-001`) or use the `AGENT_MODEL_ID` env var to swap without code changes (see §12).
 
 ---
 
@@ -325,6 +328,8 @@ gemini extensions install https://github.com/gemini-cli-extensions/mcp-toolbox
 
 ### Define Tools via `tools.yaml`
 Place `tools.yaml` in the project root. The Gemini CLI extension auto-discovers it.
+
+> **SQL parameter syntax**: `$param_name` (e.g. `$session_id`) is **genai-toolbox's named parameter syntax** — the toolbox substitutes values before sending the query to PostgreSQL. This is NOT native PostgreSQL syntax (which uses positional `$1`, `$2`). Do not run these SQL statements directly in `psql` or other PostgreSQL clients — they will fail with a syntax error.
 
 ```yaml
 sources:
@@ -659,12 +664,24 @@ from google.adk.tools import ToolContext
 
 
 async def _get_id_token(audience: str) -> str:
-    """Fetches an ID token for calling a Cloud Run service."""
+    """Fetches an ID token for calling a Cloud Run service.
+
+    google.oauth2.id_token.fetch_id_token() uses the `requests` library internally
+    and is synchronous. Run it in a thread pool executor to avoid blocking the
+    asyncio event loop — critical when multiple A2A calls run concurrently.
+    """
+    import asyncio
     import google.oauth2.id_token
     import google.auth.transport.requests
 
+    loop = asyncio.get_event_loop()
     auth_req = google.auth.transport.requests.Request()
-    token = google.oauth2.id_token.fetch_id_token(auth_req, audience)
+    token = await loop.run_in_executor(
+        None,
+        google.oauth2.id_token.fetch_id_token,
+        auth_req,
+        audience,
+    )
     return token
 
 
@@ -1425,14 +1442,21 @@ def request_human_approval(
     )
 
 
-def check_approval_status(tool_context: ToolContext) -> dict:
+def check_approval_status(session_id: str, tool_context: ToolContext) -> dict:
     """
     Checks whether a pending approval was granted or rejected.
     Call at the start of a resumed session to read the human's decision.
 
+    Args:
+        session_id: The current session identifier — used to confirm which session's
+                    approval is being checked. Pass the value from state['session:id'].
+        tool_context: ADK context object
+
     Returns:
-        {"status": "approved" | "rejected" | "pending", "action": str}
+        {"status": "approved" | "rejected" | "pending" | "none", "action": str}
     """
+    # session_id is passed explicitly so the LLM call schema has a named parameter,
+    # which helps models that require at least one non-empty property in tool schemas.
     pending = tool_context.state.get("pending_approval", {})
     return {
         "status": pending.get("status", "none"),
