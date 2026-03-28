@@ -198,6 +198,55 @@ def get_secret(secret_id: str, project_id: str) -> str:
     return response.payload.data.decode("UTF-8")
 ```
 
+### Secret Rotation Pattern
+
+Secret Manager supports automatic rotation via Cloud Scheduler + Cloud Functions. The recommended pattern for the Agent Harness:
+
+**Step 1 — Add a new secret version (do not delete the old one yet)**
+
+```bash
+# Add new version with updated credentials
+echo -n "new-db-password" | gcloud secrets versions add agent-harness-db-password \
+  --data-file=- \
+  --project=$PROJECT_ID
+
+# Verify version list
+gcloud secrets versions list agent-harness-db-password --project=$PROJECT_ID
+```
+
+**Step 2 — Validate the new secret is working**
+
+The `get_secret()` call always reads `versions/latest`, so a new Cloud Run revision automatically picks up the new version on the next call. Validate with a canary deployment (see `infra_and_cicd.md §6`).
+
+**Step 3 — Disable the old version (not delete — keep for rollback)**
+
+```bash
+# Disable old version (VERSION = previous version number, e.g. "1")
+gcloud secrets versions disable VERSION \
+  --secret=agent-harness-db-password \
+  --project=$PROJECT_ID
+
+# If rollback is needed: re-enable old version
+gcloud secrets versions enable VERSION \
+  --secret=agent-harness-db-password \
+  --project=$PROJECT_ID
+```
+
+**Automated rotation with Cloud Scheduler:**
+
+```bash
+# Create a Cloud Scheduler job to trigger rotation every 90 days
+gcloud scheduler jobs create http rotate-agent-harness-secrets \
+  --schedule="0 2 1 */3 *" \
+  --uri="https://REGION-cloudfunctions.net/rotate-secret" \
+  --message-body='{"secret_id": "agent-harness-db-password"}' \
+  --oidc-service-account-email=$SA_EMAIL \
+  --project=$PROJECT_ID \
+  --location=$REGION
+```
+
+> **Key principle**: Always add a new version before disabling the old one. Never delete secret versions — disabled versions can be re-enabled for rollback. Cloud Run reads `versions/latest` automatically, so no code changes are needed after rotation.
+
 ---
 
 ## 6. `requirements.txt` — Core Dependencies
@@ -439,10 +488,10 @@ LOG_LEVEL=INFO                        # DEBUG | INFO | WARNING | ERROR
 | `GOOGLE_CLOUD_LOCATION` | §1 | `ModelHarness`, ADK agent | adk_patterns.md §8 |
 | `REGION` | §1 | Terraform, Cloud Run | infra_and_cicd.md §1 |
 | `AGENT_MODEL_ID` | §10 | `ModelHarness` | adk_patterns.md §12 |
-| `DATABASE_URL` | §4 | `DatabaseSessionService`, MCP Toolbox | memory_and_state.md §2 |
-| `VERTEX_AI_SEARCH_DATASTORE` | §4 | `search_knowledge_base` | adk_patterns.md §10 |
-| `MODEL_ARMOR_TEMPLATE_ID` | §4 | `tools/model_armor.py` | agent_harness_gcp.md Layer 6 |
-| `MODEL_ARMOR_LOCATION` | §4 | `tools/model_armor.py` | agent_harness_gcp.md Layer 6 |
+| `DATABASE_URL` | §5 | `DatabaseSessionService`, MCP Toolbox | memory_and_state.md §2 |
+| `VERTEX_AI_SEARCH_DATASTORE` | §5 | `search_knowledge_base` | adk_patterns.md §10 |
+| `MODEL_ARMOR_TEMPLATE_ID` | §5 | `tools/model_armor.py` | agent_harness_gcp.md Layer 6 |
+| `MODEL_ARMOR_LOCATION` | §5 | `tools/model_armor.py` | agent_harness_gcp.md Layer 6 |
 | `APPROVAL_WEBHOOK_URL` | §10 | `tools/approval_gate.py` | adk_patterns.md §15 |
 | `RATE_LIMIT_FLASH_RPM` | §10 | `tools/rate_limiter.py` | error_handling.md §11 |
 | `MCP_TOOLBOX_URL` | §10 | `tools/state_tools.py` | adk_patterns.md §9 |

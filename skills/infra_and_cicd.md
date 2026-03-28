@@ -26,7 +26,7 @@ Always configure remote state before the first `terraform apply`:
 ```hcl
 terraform {
   backend "gcs" {
-    bucket = "YOUR_PROJECT_ID-tfstate"   # created in gcp_setup.md Section 7
+    bucket = "YOUR_PROJECT_ID-tfstate"   # created in gcp_setup.md §8
     prefix = "agent-harness/state"
   }
 }
@@ -513,7 +513,7 @@ git revert HEAD --no-edit && git push origin main  # triggers Cloud Build via br
 ## 7. Deployment Checklist
 
 ### Before First Deploy
-- [ ] GCS tfstate bucket created (see `gcp_setup.md` Section 7)
+- [ ] GCS tfstate bucket created (see `gcp_setup.md §8`)
 - [ ] `infra/backend.tf` configured with bucket name
 - [ ] `terraform.tfvars` created with `project_id` and `region` (gitignored)
 - [ ] Service account has all required IAM roles
@@ -536,3 +536,174 @@ git revert HEAD --no-edit && git push origin main  # triggers Cloud Build via br
 - [ ] `${PROJECT_ID}` substitution variable set in trigger
 - [ ] `eval/run_eval.py` returns exit code 0 on passing quality threshold
 - [ ] Cloud Build service account has `roles/aiplatform.user` to run eval
+
+---
+
+## 8. VPC Private Access — Network Isolation
+
+By default, Cloud Run services and AlloyDB communicate over public endpoints. For production enterprise deployments, private networking eliminates public internet exposure between internal services.
+
+### Architecture
+
+```
+Cloud Run (agent-harness)
+    │
+    │  Private IP (VPC connector)
+    ▼
+VPC Network (agent-harness-vpc)
+    ├── Cloud Run → AlloyDB (Private Service Connect)
+    ├── Cloud Run → MCP Toolbox (internal load balancer)
+    └── Cloud Run → Cloud Run (service-to-service, internal ingress)
+```
+
+### Terraform — VPC + Serverless VPC Connector
+
+```hcl
+# infra/vpc.tf
+
+# VPC network
+resource "google_compute_network" "agent_harness_vpc" {
+  name                    = "agent-harness-vpc"
+  auto_create_subnetworks = false
+  project                 = var.project_id
+}
+
+# Subnet for Cloud Run workloads
+resource "google_compute_subnetwork" "agent_harness_subnet" {
+  name          = "agent-harness-subnet"
+  ip_cidr_range = "10.8.0.0/28"
+  region        = var.region
+  network       = google_compute_network.agent_harness_vpc.id
+  project       = var.project_id
+}
+
+# Serverless VPC Access connector — bridges Cloud Run to the VPC
+resource "google_vpc_access_connector" "agent_harness_connector" {
+  name          = "agent-harness-connector"
+  region        = var.region
+  project       = var.project_id
+  network       = google_compute_network.agent_harness_vpc.name
+  ip_cidr_range = "10.8.1.0/28"   # Separate /28 range for the connector
+
+  min_instances = 2
+  max_instances = 10
+}
+
+# AlloyDB private service connection
+resource "google_compute_global_address" "alloydb_private_ip" {
+  name          = "alloydb-private-ip"
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = 16
+  network       = google_compute_network.agent_harness_vpc.id
+  project       = var.project_id
+}
+
+resource "google_service_networking_connection" "alloydb_private_vpc" {
+  network                 = google_compute_network.agent_harness_vpc.id
+  service                 = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.alloydb_private_ip.name]
+}
+```
+
+### Attach the VPC Connector to Cloud Run
+
+```hcl
+# infra/main.tf — Cloud Run service with VPC connector
+resource "google_cloud_run_v2_service" "agent_harness" {
+  name     = var.service_name
+  location = var.region
+  project  = var.project_id
+
+  template {
+    vpc_access {
+      connector = google_vpc_access_connector.agent_harness_connector.id
+      egress    = "ALL_TRAFFIC"   # Route all outbound traffic through VPC
+      # egress = "PRIVATE_RANGES_ONLY"  # Only private IPs through VPC (public APIs still direct)
+    }
+
+    # ... rest of template (containers, env, etc.)
+  }
+}
+```
+
+### Internal-Only Ingress for Service-to-Service Calls
+
+When Cloud Run services call each other (e.g., Coordinator → Specialist Agent), restrict ingress to internal traffic only:
+
+```hcl
+# The specialist agent only accepts internal (VPC) traffic
+resource "google_cloud_run_v2_service" "sre_specialist_agent" {
+  name     = "sre-specialist-agent"
+  location = var.region
+  project  = var.project_id
+
+  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"   # Block all public internet traffic
+
+  # ... template
+}
+```
+
+```bash
+# Equivalent gcloud command
+gcloud run services update sre-specialist-agent \
+  --ingress=internal \
+  --region=$REGION \
+  --project=$PROJECT_ID
+```
+
+### Cloud NAT — Outbound Access to Public APIs (Gemini global endpoint)
+
+With `ALL_TRAFFIC` routing through VPC, Cloud Run loses direct internet access. Cloud NAT restores outbound access to public APIs (Gemini, Secret Manager, etc.) without exposing inbound ports:
+
+```hcl
+# infra/vpc.tf — Cloud Router + NAT
+resource "google_compute_router" "agent_harness_router" {
+  name    = "agent-harness-router"
+  region  = var.region
+  network = google_compute_network.agent_harness_vpc.id
+  project = var.project_id
+}
+
+resource "google_compute_router_nat" "agent_harness_nat" {
+  name                               = "agent-harness-nat"
+  router                             = google_compute_router.agent_harness_router.name
+  region                             = var.region
+  project                            = var.project_id
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+}
+```
+
+> **Why Cloud NAT**: The Gemini global endpoint (`generativelanguage.googleapis.com`) is a public API. Even with full VPC routing, the agent must be able to reach it. Cloud NAT provides outbound-only internet access without any inbound exposure.
+
+### Private Service Connect for Vertex AI (Optional — High Security)
+
+For stricter environments, use Private Service Connect to reach Vertex AI endpoints without traversing the public internet:
+
+```bash
+# Create a Private Service Connect endpoint for Vertex AI
+gcloud compute addresses create vertexai-psc-endpoint \
+  --global \
+  --purpose=PRIVATE_SERVICE_CONNECT \
+  --addresses=10.8.2.0 \
+  --network=agent-harness-vpc \
+  --project=$PROJECT_ID
+
+gcloud compute forwarding-rules create vertexai-psc-rule \
+  --global \
+  --network=agent-harness-vpc \
+  --address=vertexai-psc-endpoint \
+  --target-google-apis-bundle=all-apis \
+  --project=$PROJECT_ID
+```
+
+### VPC Private Access Checklist
+
+- [ ] `agent-harness-vpc` and `agent-harness-subnet` created via Terraform
+- [ ] Serverless VPC Access connector created and attached to Cloud Run
+- [ ] AlloyDB provisioned with private IP via Private Services Access
+- [ ] `DATABASE_URL` uses private IP (not public endpoint)
+- [ ] Internal-only ingress set for specialist agents (`INGRESS_TRAFFIC_INTERNAL_ONLY`)
+- [ ] Cloud NAT configured if using `egress = "ALL_TRAFFIC"`
+- [ ] Verify private connectivity: `gcloud run services describe` shows VPC connector attached
