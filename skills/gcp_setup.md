@@ -369,3 +369,80 @@ With the `gcloud` extension:
 ```
 gemini "verify that all required APIs are enabled and that the agent-harness-sa service account has the correct IAM roles in project YOUR_PROJECT_ID"
 ```
+
+---
+
+## 10. Master Environment Variable Reference
+
+A single consolidated reference for every environment variable used across the Agent Harness stack. Copy this to `agents/.env.example` and fill in the values.
+
+```bash
+# ═══════════════════════════════════════════════════════════════════════
+# agents/.env.example — Master environment variable reference
+# Copy to agents/.env for local development.
+# Production values are injected via infra/main.tf deployment_spec
+# and Secret Manager (see §4).
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── GCP Core ───────────────────────────────────────────────────────────
+GOOGLE_CLOUD_PROJECT=your-project-id
+GOOGLE_CLOUD_LOCATION=global          # Gemini global endpoint — do NOT set to us-central1
+REGION=us-central1                    # Infrastructure deployment region (Cloud Run, AlloyDB, etc.)
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json  # Local dev only
+
+# ── Agent Model ─────────────────────────────────────────────────────────
+AGENT_MODEL_ID=gemini-2.5-flash       # Override model without code changes (see adk_patterns.md §12)
+                                      # Verify available IDs: gcloud ai models list --region=global
+
+# ── ADK / Agent Engine ─────────────────────────────────────────────────
+GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY=true
+OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true
+AGENT_ENGINE_RESOURCE_NAME=projects/PROJECT_ID/locations/us-central1/reasoningEngines/RESOURCE_ID
+
+# ── Database / Session Persistence (ZDR) ───────────────────────────────
+DATABASE_URL=postgresql://user:password@host:5432/harness_db
+DB_USER=harness_user
+DB_PASSWORD=your-db-password          # Inject from Secret Manager in production
+
+# ── MCP Toolbox ────────────────────────────────────────────────────────
+MCP_TOOLBOX_URL=http://localhost:5000/sse   # Local dev (genai-toolbox server)
+# MCP_TOOLBOX_URL=https://mcp-toolbox-<hash>.run.app/sse  # Production
+
+# ── Vertex AI Search (RAG / Grounding) ─────────────────────────────────
+VERTEX_AI_SEARCH_DATASTORE=projects/PROJECT_ID/locations/global/collections/default_collection/dataStores/DATASTORE_ID
+
+# ── Model Armor ─────────────────────────────────────────────────────────
+MODEL_ARMOR_TEMPLATE_ID=your-template-id
+MODEL_ARMOR_LOCATION=us-central1      # Model Armor service region (regional API — NOT global)
+                                      # Independent of GOOGLE_CLOUD_LOCATION=global
+
+# ── A2A Specialist Agents ───────────────────────────────────────────────
+SRE_AGENT_URL=https://sre-specialist-agent-<hash>-uc.a.run.app
+ARCH_AGENT_URL=https://architect-agent-<hash>-uc.a.run.app
+
+# ── Human-in-the-Loop Approvals ─────────────────────────────────────────
+APPROVAL_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+
+# ── Rate Limiting (see error_handling.md §11) ───────────────────────────
+RATE_LIMIT_FLASH_RPM=600              # 60% of 1,000 RPM quota — leave headroom for bursts
+RATE_LIMIT_PRO_RPM=200               # ~55% of 360 RPM quota
+
+# ── Observability ───────────────────────────────────────────────────────
+LOG_LEVEL=INFO                        # DEBUG | INFO | WARNING | ERROR
+```
+
+### Variable-to-Skill Cross-Reference
+
+| Variable | Set In | Consumed By | Skill Reference |
+|----------|--------|-------------|-----------------|
+| `GOOGLE_CLOUD_PROJECT` | §1 | All | gcp_setup.md §1 |
+| `GOOGLE_CLOUD_LOCATION` | §1 | `ModelHarness`, ADK agent | adk_patterns.md §8 |
+| `REGION` | §1 | Terraform, Cloud Run | infra_and_cicd.md §1 |
+| `AGENT_MODEL_ID` | §10 | `ModelHarness` | adk_patterns.md §12 |
+| `DATABASE_URL` | §4 | `DatabaseSessionService`, MCP Toolbox | memory_and_state.md §2 |
+| `VERTEX_AI_SEARCH_DATASTORE` | §4 | `search_knowledge_base` | adk_patterns.md §10 |
+| `MODEL_ARMOR_TEMPLATE_ID` | §4 | `tools/model_armor.py` | agent_harness_gcp.md Layer 6 |
+| `MODEL_ARMOR_LOCATION` | §4 | `tools/model_armor.py` | agent_harness_gcp.md Layer 6 |
+| `APPROVAL_WEBHOOK_URL` | §10 | `tools/approval_gate.py` | adk_patterns.md §15 |
+| `RATE_LIMIT_FLASH_RPM` | §10 | `tools/rate_limiter.py` | error_handling.md §11 |
+| `MCP_TOOLBOX_URL` | §10 | `tools/state_tools.py` | adk_patterns.md §9 |

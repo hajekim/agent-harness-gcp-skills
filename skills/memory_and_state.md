@@ -285,7 +285,7 @@ sources:
   agent-state-db:
     kind: alloydb-postgres
     project: ${GOOGLE_CLOUD_PROJECT}
-    region: us-central1
+    region: ${REGION}             # Inject from env — set REGION=us-central1 in agents/.env
     cluster: agent-harness-cluster
     instance: agent-harness-instance
     database: harness_db

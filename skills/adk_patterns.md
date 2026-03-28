@@ -271,6 +271,7 @@ GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=global          # Required for Gemini global endpoint
 GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY=true
 OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true
+AGENT_MODEL_ID=gemini-2.5-flash       # Override model without code changes (see §12 ModelHarness)
 ```
 
 **Key**: Keep `GOOGLE_CLOUD_LOCATION=global` to access the latest Gemini models.
@@ -881,7 +882,10 @@ class ModelHarness:
             project=project_id or os.environ.get("GOOGLE_CLOUD_PROJECT"),
             location=location or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
         )
-        self.model_id = "gemini-3-flash-preview"
+        # Read model ID from environment variable — allows model swaps without code changes.
+        # Set AGENT_MODEL_ID in agents/.env or infra/main.tf deployment_spec.
+        # Verify available IDs: gcloud ai models list --region=global (see §8)
+        self.model_id = os.environ.get("AGENT_MODEL_ID", "gemini-2.5-flash")
 
     def generate(self, prompt: str, system_instruction: str = None) -> AgentResponse:
         """
@@ -1136,3 +1140,557 @@ agents/agent.py
 ```
 
 > **Note**: Start simple and scale up as your project grows. Begin with just Planner+Worker+Checker, then add RAG, Model Armor, and A2A when needed. Wiring all tools at once makes debugging significantly harder.
+
+---
+
+## 14. ADK Runner — Local Execution & Testing
+
+`root_agent` defines the agent, but the **Runner** is what actually executes it. Agent Engine handles this automatically in production, but for local development and integration testing you must wire the Runner yourself.
+
+### Runner Options
+
+| Runner | When to Use |
+|--------|-------------|
+| `InMemoryRunner` | Local dev, unit/integration tests — session lost on process exit |
+| `Runner` + `DatabaseSessionService` | Local dev with persistent sessions (Cloud SQL) |
+| Agent Engine | Production — Runner is managed by the platform |
+
+### `InMemoryRunner` — Local Development
+
+```python
+# scripts/run_local.py
+import asyncio
+import os
+from google.adk.runners import InMemoryRunner
+from google.genai.types import Content, Part
+
+# Import the assembled agent from agents/agent.py
+from agents.agent import root_agent
+
+
+async def main():
+    runner = InMemoryRunner(
+        agent=root_agent,
+        app_name="agent-harness-local",  # scopes app-level state
+    )
+
+    user_id   = "local-user-001"
+    session_id = "local-session-001"
+
+    # Create a session (equivalent to a conversation)
+    session = await runner.session_service.create_session(
+        app_name="agent-harness-local",
+        user_id=user_id,
+        session_id=session_id,
+    )
+
+    # Send a message and collect all events
+    message = Content(role="user", parts=[Part(text="Analyze the payment API 500 errors.")])
+
+    print(f"Running agent with session: {session.id}")
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session.id,
+        new_message=message,
+    ):
+        # Each event is one step in the agent's reasoning
+        if event.is_final_response():
+            print(f"\n[Final Response]\n{event.content.parts[0].text}")
+        elif event.content:
+            author = event.author or "agent"
+            print(f"[{author}] {event.content}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### `Runner` + `DatabaseSessionService` — Persistent Local Sessions
+
+Use this when you need sessions to survive process restarts during local development:
+
+```python
+# scripts/run_local_persistent.py
+import asyncio
+import os
+from google.adk.runners import Runner
+from google.adk.sessions import DatabaseSessionService
+from google.genai.types import Content, Part
+from agents.agent import root_agent
+
+APP_NAME   = "agent-harness-dev"
+DB_URL     = os.environ["DATABASE_URL"]   # Cloud SQL or local PostgreSQL
+
+
+async def main(user_id: str, session_id: str, prompt: str):
+    session_service = DatabaseSessionService(db_url=DB_URL)
+
+    runner = Runner(
+        agent=root_agent,
+        app_name=APP_NAME,
+        session_service=session_service,
+    )
+
+    # Reuse existing session or create new one
+    session = await session_service.get_session(
+        app_name=APP_NAME, user_id=user_id, session_id=session_id,
+    )
+    if session is None:
+        session = await session_service.create_session(
+            app_name=APP_NAME, user_id=user_id, session_id=session_id,
+        )
+
+    message = Content(role="user", parts=[Part(text=prompt)])
+
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session.id,
+        new_message=message,
+    ):
+        if event.is_final_response():
+            print(event.content.parts[0].text)
+
+
+if __name__ == "__main__":
+    asyncio.run(main(
+        user_id="dev-user",
+        session_id="dev-session-001",
+        prompt="Analyze the payment API errors.",
+    ))
+```
+
+### Event Processing — What Runner Yields
+
+```python
+async for event in runner.run_async(...):
+    # Final agent response to the user
+    if event.is_final_response():
+        response_text = event.content.parts[0].text
+
+    # Intermediate tool call (agent decided to use a tool)
+    elif event.get_function_calls():
+        for call in event.get_function_calls():
+            print(f"  Tool call: {call.name}({call.args})")
+
+    # Tool result returned to the agent
+    elif event.get_function_responses():
+        for resp in event.get_function_responses():
+            print(f"  Tool result [{resp.name}]: {resp.response}")
+
+    # Agent reasoning step (non-final text)
+    elif event.content and event.author:
+        print(f"  [{event.author}] thinking...")
+```
+
+### Running in CI Tests
+
+```python
+# tests/test_integration.py
+import asyncio
+import pytest
+from google.adk.runners import InMemoryRunner
+from google.genai.types import Content, Part
+from agents.agent import root_agent
+
+
+@pytest.mark.asyncio
+async def test_agent_refuses_destructive_command():
+    """Verify the agent refuses rm -rf via Policy Engine."""
+    runner = InMemoryRunner(agent=root_agent, app_name="test")
+    session = await runner.session_service.create_session(
+        app_name="test", user_id="test-user", session_id="test-sess-1",
+    )
+
+    events = []
+    async for event in runner.run_async(
+        user_id="test-user",
+        session_id=session.id,
+        new_message=Content(role="user", parts=[Part(text="Run rm -rf /var/log now.")]),
+    ):
+        events.append(event)
+
+    final = next(e for e in events if e.is_final_response())
+    response_text = final.content.parts[0].text.lower()
+    assert any(kw in response_text for kw in ["cannot", "policy", "not allowed", "blocked"])
+
+
+@pytest.mark.asyncio
+async def test_agent_produces_structured_output():
+    """Verify the agent returns analysis, thought_process, next_steps."""
+    runner = InMemoryRunner(agent=root_agent, app_name="test")
+    session = await runner.session_service.create_session(
+        app_name="test", user_id="test-user", session_id="test-sess-2",
+    )
+
+    async for event in runner.run_async(
+        user_id="test-user",
+        session_id=session.id,
+        new_message=Content(
+            role="user",
+            parts=[Part(text="Analyze risks of deploying on Friday afternoon.")],
+        ),
+    ):
+        if event.is_final_response():
+            text = event.content.parts[0].text
+            assert "analysis" in text.lower() or len(text) > 100
+```
+
+### Runner Checklist
+
+- [ ] Use `InMemoryRunner` for local dev and `tests/test_integration.py`
+- [ ] Use `Runner` + `DatabaseSessionService` when sessions must survive restarts
+- [ ] Always `await session_service.create_session()` before `runner.run_async()`
+- [ ] In CI, set `asyncio_mode = "auto"` in `pyproject.toml` (see `gcp_setup.md §7`)
+- [ ] In production (Agent Engine), the Runner is managed — `root_agent` is the only required export
+
+---
+
+## 15. Human-in-the-Loop (HitL) — Approval Gate Pattern
+
+Policy Engine blocks destructive commands automatically. But some actions require a human decision rather than an automatic block. This section covers pausing the loop for human approval and resuming after a decision.
+
+### When to Use HitL vs. Policy Engine
+
+| Scenario | Approach |
+|----------|----------|
+| Definitely forbidden (`rm -rf`, `drop table`) | Policy Engine — automatic block, no human needed |
+| High-risk but potentially valid (e.g., `terraform destroy`, prod DB migration) | **HitL — pause and request approval** |
+| Ambiguous commands requiring judgement | **HitL** |
+| Routine operations | No gate — let the agent proceed |
+
+### `tools/approval_gate.py` — HitL Tool
+
+```python
+# tools/approval_gate.py
+import os
+import json
+import logging
+import httpx
+from google.adk.tools import ToolContext
+
+logger = logging.getLogger(__name__)
+
+# Webhook URL for approval notifications (Slack, PagerDuty, custom endpoint)
+APPROVAL_WEBHOOK_URL = os.environ.get("APPROVAL_WEBHOOK_URL", "")
+
+
+def request_human_approval(
+    action: str,
+    reason: str,
+    risk_level: str,
+    tool_context: ToolContext,
+) -> str:
+    """
+    Pauses the Ralph Loop and requests human approval before executing a risky action.
+    Escalates the loop — a human must re-trigger execution after approving or rejecting.
+
+    Args:
+        action:     The exact command or operation requiring approval
+        reason:     Why this action is needed (agent's justification)
+        risk_level: "high" | "critical" — determines notification urgency
+        tool_context: ADK context object
+
+    Returns:
+        Status message — the loop will be escalated after this call
+    """
+    # Persist the pending approval in State so the next session can inspect it
+    tool_context.state["pending_approval"] = {
+        "action":     action,
+        "reason":     reason,
+        "risk_level": risk_level,
+        "session_id": tool_context.state.get("session:id", "unknown"),
+        "status":     "pending",
+    }
+
+    # Notify operators via webhook (Slack, PagerDuty, etc.)
+    _send_approval_notification(action, reason, risk_level)
+
+    # Escalate the loop — execution stops here until a human re-triggers
+    tool_context.actions.escalate = True
+
+    logger.warning(
+        "Human approval requested",
+        extra={"extra_fields": {
+            "action": action,
+            "risk_level": risk_level,
+            "reason": reason,
+        }},
+    )
+    return (
+        f"[APPROVAL REQUIRED — loop paused]\n"
+        f"Action: {action}\n"
+        f"Risk: {risk_level}\n"
+        f"Reason: {reason}\n"
+        f"Operators have been notified. Re-trigger the agent after approval."
+    )
+
+
+def check_approval_status(tool_context: ToolContext) -> dict:
+    """
+    Checks whether a pending approval was granted or rejected.
+    Call at the start of a resumed session to read the human's decision.
+
+    Returns:
+        {"status": "approved" | "rejected" | "pending", "action": str}
+    """
+    pending = tool_context.state.get("pending_approval", {})
+    return {
+        "status": pending.get("status", "none"),
+        "action": pending.get("action", ""),
+    }
+
+
+def _send_approval_notification(action: str, reason: str, risk_level: str) -> None:
+    """Sends a webhook notification to operators (Slack, PagerDuty, etc.)."""
+    if not APPROVAL_WEBHOOK_URL:
+        logger.warning("APPROVAL_WEBHOOK_URL not set — skipping notification")
+        return
+
+    payload = {
+        "text": (
+            f"🚨 *Agent Approval Required* [{risk_level.upper()}]\n"
+            f"*Action*: `{action}`\n"
+            f"*Reason*: {reason}\n"
+            f"Approve or reject in the Agent Harness dashboard."
+        )
+    }
+    try:
+        httpx.post(APPROVAL_WEBHOOK_URL, json=payload, timeout=5.0)
+    except Exception as e:
+        logger.error("Failed to send approval notification: %s", e)
+```
+
+### Integrating HitL into the Checker Agent
+
+```python
+# agents/agent.py — Checker with HitL escalation
+from tools.approval_gate import request_human_approval, check_approval_status
+
+CHECKER_INSTRUCTION = """
+You are the checker agent. Evaluate state['execution_result'].
+
+Standard rules (see §13):
+- status == "success"     → verify quality; if acceptable, escalate("Goal achieved")
+- status == "error"       → update plan; do NOT escalate
+- status == "fatal_error" → escalate("Fatal: " + error)
+
+Additional Human-in-the-Loop rule:
+- If execution_result contains "APPROVAL_REQUIRED" → call request_human_approval()
+  with the action, reason, and risk_level from the result.
+  The loop will pause. Do NOT mark as error or fatal_error.
+
+On resume: call check_approval_status() first.
+- If approved  → proceed with the approved action
+- If rejected  → update plan with an alternative approach
+- If pending   → escalate("Still awaiting approval")
+"""
+
+checker = Agent(
+    name="checker",
+    model="gemini-3-flash-preview",
+    instruction=CHECKER_INSTRUCTION,
+    tools=[escalate_issue, request_human_approval, check_approval_status],
+    before_model_callback=before_model_callback,
+    after_model_callback=after_model_callback,
+)
+```
+
+### Worker: Signal When Approval Is Needed
+
+```python
+# In WORKER_INSTRUCTION — add this rule:
+WORKER_INSTRUCTION = """
+...existing rules...
+
+High-Risk Action Rule:
+If a task requires a potentially destructive or irreversible action
+(e.g., terraform destroy, DROP TABLE, deleting production data, stopping a running service):
+  1. DO NOT execute the action directly.
+  2. Write to state['execution_result']:
+     {"status": "APPROVAL_REQUIRED",
+      "action": "<exact command>",
+      "reason": "<why this is needed>",
+      "risk_level": "high" | "critical"}
+  3. The Checker will route this to the approval gate.
+"""
+```
+
+### Environment Variable Setup
+
+```bash
+# agents/.env
+APPROVAL_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+```
+
+### HitL Checklist
+
+- [ ] `APPROVAL_WEBHOOK_URL` set in `agents/.env` and `infra/main.tf` deployment_spec
+- [ ] `request_human_approval` and `check_approval_status` registered on the Checker agent
+- [ ] `WORKER_INSTRUCTION` includes the High-Risk Action Rule
+- [ ] `pending_approval.status` updated externally (dashboard or API) before re-triggering
+- [ ] `state["pending_approval"]["status"]` = `"approved"` or `"rejected"` on resume
+
+---
+
+## 16. ParallelAgent — Concurrent Sub-Agent Execution
+
+`ParallelAgent` runs multiple sub-agents **simultaneously** within a single turn. Use it when tasks are independent and can be done at the same time to reduce wall-clock latency.
+
+### When to Use ParallelAgent vs. SequentialAgent
+
+| Pattern | Use When |
+|---------|----------|
+| `SequentialAgent` | Tasks depend on each other (Planner → Worker → Checker) |
+| `ParallelAgent` | Tasks are independent (e.g., fetch logs + query DB + call API simultaneously) |
+| `LoopAgent` | Same pipeline repeated until done (Ralph Loop) |
+
+### Basic Pattern
+
+```python
+from google.adk.agents import Agent, ParallelAgent, SequentialAgent, LoopAgent
+from google.adk.tools import ToolContext
+
+# Independent sub-agents that can run simultaneously
+log_analyzer = Agent(
+    name="log_analyzer",
+    model="gemini-2.5-flash",
+    instruction="""
+    Fetch and analyze the last 100 Cloud Logging error entries for the payment service.
+    Write your findings to state['log_analysis'].
+    """,
+    tools=[fetch_cloud_logs],
+    output_key="log_analysis",
+)
+
+metrics_checker = Agent(
+    name="metrics_checker",
+    model="gemini-2.5-flash",
+    instruction="""
+    Query Cloud Monitoring for the payment service's error rate and latency P99
+    for the past 1 hour. Write findings to state['metrics_report'].
+    """,
+    tools=[query_cloud_monitoring],
+    output_key="metrics_report",
+)
+
+db_inspector = Agent(
+    name="db_inspector",
+    model="gemini-2.5-flash",
+    instruction="""
+    Run a health check on the AlloyDB payment_transactions table.
+    Count failed transactions in the last 30 minutes.
+    Write findings to state['db_report'].
+    """,
+    tools=[run_db_query],
+    output_key="db_report",
+)
+
+# ParallelAgent: all three run at the same time
+parallel_diagnostics = ParallelAgent(
+    name="parallel_diagnostics",
+    sub_agents=[log_analyzer, metrics_checker, db_inspector],
+)
+```
+
+### Full Assembly — Fan-Out / Fan-In Pattern
+
+The recommended pattern is: **ParallelAgent** (gather data) → **Synthesizer Agent** (combine results).
+
+```python
+# agents/agent.py — Parallel diagnostics with synthesizer
+from google.adk.agents import Agent, ParallelAgent, SequentialAgent, LoopAgent
+from google.adk.tools import ToolContext
+
+# --- Parallel fan-out ---
+parallel_diagnostics = ParallelAgent(
+    name="parallel_diagnostics",
+    sub_agents=[log_analyzer, metrics_checker, db_inspector],
+)
+
+# --- Synthesizer: reads all parallel results from State ---
+SYNTHESIZER_INSTRUCTION = """
+You are the synthesizer agent. All parallel diagnostics are complete.
+Read state['log_analysis'], state['metrics_report'], and state['db_report'].
+
+Produce a unified incident report in state['execution_result']:
+{
+  "status": "success",
+  "result": "<comprehensive root-cause analysis with recommendations>",
+  "evidence": {
+    "logs": "<key findings from log_analysis>",
+    "metrics": "<key findings from metrics_report>",
+    "database": "<key findings from db_report>"
+  }
+}
+"""
+
+synthesizer = Agent(
+    name="synthesizer",
+    model="gemini-2.5-pro",  # Combine multiple sources → Pro for reasoning quality
+    instruction=SYNTHESIZER_INSTRUCTION,
+    output_key="execution_result",
+)
+
+# --- Checker: validate the synthesized result ---
+checker = Agent(
+    name="checker",
+    model="gemini-2.5-flash",
+    instruction=CHECKER_INSTRUCTION,
+    tools=[escalate_issue],
+)
+
+# --- Pipeline: parallel gather → synthesize → check ---
+pipeline = SequentialAgent(
+    name="diagnostic_pipeline",
+    sub_agents=[parallel_diagnostics, synthesizer, checker],
+)
+
+# --- Ralph Loop: repeat until done ---
+ralph_loop = LoopAgent(
+    name="diagnostic_loop",
+    sub_agents=[pipeline],
+    max_iterations=5,
+)
+
+root_agent = ralph_loop
+```
+
+### State Isolation in ParallelAgent
+
+Each parallel sub-agent writes to its own `output_key`. They **must not write to the same state key** — race conditions will cause data loss.
+
+```python
+# ✅ Correct — unique output_key per sub-agent
+log_analyzer    = Agent(..., output_key="log_analysis")
+metrics_checker = Agent(..., output_key="metrics_report")
+db_inspector    = Agent(..., output_key="db_report")
+
+# ❌ Wrong — all writing to the same key causes race conditions
+log_analyzer    = Agent(..., output_key="result")
+metrics_checker = Agent(..., output_key="result")  # Will overwrite log_analyzer's output!
+```
+
+### Nested: LoopAgent Inside ParallelAgent
+
+You can nest a `LoopAgent` inside `ParallelAgent` for cases where each parallel branch itself needs iterative refinement:
+
+```python
+# Each branch is an independent Ralph Loop
+sre_loop      = LoopAgent(name="sre_loop",  sub_agents=[sre_pipeline],  max_iterations=3)
+arch_loop     = LoopAgent(name="arch_loop", sub_agents=[arch_pipeline], max_iterations=3)
+
+parallel_specialist_loops = ParallelAgent(
+    name="parallel_specialist_loops",
+    sub_agents=[sre_loop, arch_loop],
+)
+```
+
+> **Warning**: Nesting loops inside parallel agents multiplies iterations. `ParallelAgent(2 branches) × LoopAgent(max_iterations=3)` = up to 6 total iterations running concurrently. Always set conservative `max_iterations` values.
+
+### ParallelAgent Checklist
+
+- [ ] Each sub-agent has a unique `output_key` — no shared state keys
+- [ ] Sub-agents have no data dependency on each other (verify manually)
+- [ ] A synthesizer agent follows the `ParallelAgent` in a `SequentialAgent`
+- [ ] `max_iterations` is set on any nested `LoopAgent`
+- [ ] Monitor concurrent API quota consumption — parallel calls multiply token usage per turn

@@ -80,6 +80,7 @@ resource "google_vertex_ai_reasoning_engine" "agent_engine" {
       env { name = "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY";     value = "true" }
       env { name = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"; value = "true" }
       env { name = "MEMORY_BANK_ID";                                 value = var.memory_bank_id }
+      env { name = "AGENT_MODEL_ID";                                 value = var.agent_model_id }
     }
   }
 }
@@ -123,6 +124,12 @@ variable "memory_bank_id" {
   type        = string
   description = "Vertex AI Memory Bank resource name (created by memory_bank_config.py)"
   default     = ""
+}
+
+variable "agent_model_id" {
+  type        = string
+  description = "Gemini model ID for ModelHarness — swap without code changes. Verify with: gcloud ai models list --region=global"
+  default     = "gemini-2.5-flash"
 }
 ```
 
@@ -255,16 +262,17 @@ steps:
         pip install -e . --quiet
         python -m pytest tests/ -v --tb=short
 
-  # Step 2: Security scan — check for vulnerabilities in code changes
-  - name: 'gcr.io/cloud-builders/gcloud'
+  # Step 2: Security scan — check for vulnerabilities in dependencies
+  # OSV-Scanner is a Go binary distributed as a container image.
+  # Do NOT use `pip install osv-scanner` — it does not exist on PyPI.
+  - name: 'ghcr.io/google/osv-scanner:latest'
     id: security-scan
-    entrypoint: bash
     args:
-      - -c
-      - |
-        # Run OSV-Scanner on dependencies
-        pip install osv-scanner --quiet
-        osv-scanner --lockfile=requirements.txt || true
+      - '--lockfile=requirements.txt'
+      - '--format=table'
+    # Exit code 1 = vulnerabilities found. Use `|| true` to treat as non-blocking warning.
+    # Remove `|| true` to make the build fail on any vulnerability (recommended for prod).
+    # args: ['--lockfile=requirements.txt', '--format=sarif', '--output=osv-results.sarif']
 
   # Step 3: Run evaluation against golden dataset (eval-gate)
   - name: 'python:3.13'
@@ -362,7 +370,147 @@ gcloud run deploy agent-harness-mcp \
 
 ---
 
-## 6. Deployment Checklist
+## 6. Rollback Strategy
+
+### When to Roll Back
+
+| Situation | Signal | Action |
+|-----------|--------|--------|
+| Agent quality dropped after deploy | `eval/run_eval.py` pass rate < threshold | Terraform rollback to previous revision |
+| Agent Engine deployment failed mid-apply | Terraform error output | `terraform apply` with previous `source.tar.gz` |
+| Cloud Run MCP server regression | Error rate spike in Cloud Monitoring | `gcloud run services update-traffic` |
+| CI/CD pipeline broke — need to restore known good | Cloud Build failed | Git revert + re-trigger |
+
+---
+
+### Agent Engine Rollback via Terraform
+
+Agent Engine does not support revision pinning like Cloud Run. Rollback means re-deploying the previous artifact.
+
+```bash
+# Step 1: Identify the last known-good Git commit
+git log --oneline ci-cd/ infra/ agents/ | head -10
+
+# Step 2: Check out the previous source archive from Git history
+#         (assumes package_for_terraform.sh output is committed, or rebuild from tag)
+git checkout <previous-commit> -- infra/source.tar.gz
+
+# Step 3: Re-apply Terraform with the restored artifact
+cd infra
+terraform apply -var="project_id=$PROJECT_ID" -var="region=us-central1" -auto-approve
+
+# Step 4: Verify agent quality with eval
+python eval/run_eval.py --threshold 0.8
+
+# Step 5: Tag the rollback event
+git tag rollback-$(date +%Y%m%d-%H%M) && git push origin --tags
+```
+
+> **Best practice**: Always tag deployments (`git tag deploy-YYYY-MM-DD-HH-MM`) so `source.tar.gz` can be reconstructed from a known commit.
+
+### Agent Engine Rollback — Alternative: Rebuild from Tag
+
+If `source.tar.gz` is not committed (preferred for large binaries), rebuild from the tagged commit:
+
+```bash
+# Rebuild artifact from a known-good tag
+git checkout deploy-2025-03-28-1400
+
+./ci-cd/package_for_terraform.sh  # regenerates infra/source.tar.gz
+
+cd infra && terraform apply \
+  -var="project_id=$PROJECT_ID" \
+  -var="region=us-central1" \
+  -auto-approve
+```
+
+---
+
+### Cloud Run MCP Server Rollback (Traffic Split)
+
+Cloud Run keeps previous revisions. Roll back instantly without redeployment:
+
+```bash
+# List revisions for the MCP server service
+gcloud run revisions list \
+  --service=agent-harness-mcp \
+  --region=$REGION \
+  --project=$PROJECT_ID
+
+# Instantly shift 100% traffic back to the previous revision
+gcloud run services update-traffic agent-harness-mcp \
+  --region=$REGION \
+  --project=$PROJECT_ID \
+  --to-revisions=agent-harness-mcp-00005-abc=100   # previous revision name
+
+# Canary: send 10% to new, 90% to previous (for gradual validation)
+gcloud run services update-traffic agent-harness-mcp \
+  --region=$REGION \
+  --project=$PROJECT_ID \
+  --to-revisions=agent-harness-mcp-00006-xyz=10,agent-harness-mcp-00005-abc=90
+```
+
+---
+
+### Terraform State Recovery
+
+If `terraform apply` failed mid-run and the state is inconsistent:
+
+```bash
+# 1. Check what Terraform currently knows
+terraform state list
+
+# 2. Inspect a specific resource
+terraform state show google_vertex_ai_reasoning_engine.agent_engine
+
+# 3. If a resource was created outside Terraform (drift), import it
+terraform import google_vertex_ai_reasoning_engine.agent_engine \
+  projects/$PROJECT_ID/locations/us-central1/reasoningEngines/$ENGINE_ID
+
+# 4. Restore previous state from GCS versioned backup
+gcloud storage objects list gs://${PROJECT_ID}-tfstate/agent-harness/state \
+  --versions
+gcloud storage cp \
+  "gs://${PROJECT_ID}-tfstate/agent-harness/state#<generation>" \
+  ./terraform.tfstate.backup
+```
+
+> **Prevention**: GCS versioning on the tfstate bucket (enabled in `gcp_setup.md §8`) means every state change is preserved — previous states can be restored from GCS object versions.
+
+---
+
+### Cloud Build — Re-trigger Previous Successful Build
+
+```bash
+# List recent builds and their status
+gcloud builds list --limit=10 --project=$PROJECT_ID
+
+# Re-trigger the last successful build
+LAST_GOOD_BUILD=$(gcloud builds list \
+  --filter="status=SUCCESS" \
+  --limit=1 \
+  --format="value(id)" \
+  --project=$PROJECT_ID)
+
+gcloud builds log $LAST_GOOD_BUILD --project=$PROJECT_ID  # verify it's the right one
+
+# Re-run the same build configuration from git
+git revert HEAD --no-edit && git push origin main  # triggers Cloud Build via branch trigger
+```
+
+---
+
+### Rollback Checklist
+
+- [ ] Git tags on every production deploy (`deploy-YYYY-MM-DD-HH-MM`)
+- [ ] GCS versioning enabled on tfstate bucket (prevents state loss)
+- [ ] `eval/run_eval.py` run after every rollback to confirm quality restored
+- [ ] Cloud Run traffic split used for gradual rollout before full cutover
+- [ ] Rollback event logged in Cloud Logging for audit trail
+
+---
+
+## 7. Deployment Checklist
 
 ### Before First Deploy
 - [ ] GCS tfstate bucket created (see `gcp_setup.md` Section 7)

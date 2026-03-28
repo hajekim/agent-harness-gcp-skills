@@ -778,4 +778,190 @@ logger.info("Agent Harness initializing", extra={"extra_fields": {
 - [ ] Record LLM call trace spans in `before_model_callback` / `after_model_callback`
 - [ ] After Cloud Run deployment, verify `jsonPayload` collection with `gcloud logging read`
 - [ ] Verify agent reasoning path visualization in the Cloud Trace console
+
+---
+
+## 11. Rate Limiting — Quota Pre-Control
+
+`ResourceExhausted` (429) is one of the most common failures in production agent harnesses. The standard retry-with-backoff in §2 handles individual call failures, but it does not prevent quota from being exhausted in the first place. This section adds a **token bucket pre-control layer** that proactively throttles requests before hitting the API quota wall.
+
+### Why Pre-Control Instead of Pure Retry
+
+| Approach | Problem |
+|----------|---------|
+| Retry only | Parallel agents retry simultaneously → quota storm, cascading failures |
+| Pre-control | Smooth request rate before calls reach the API → predictable throughput |
+
+### `tools/rate_limiter.py` — Token Bucket Implementation
+
+```python
+# tools/rate_limiter.py
+"""
+Token bucket rate limiter for Gemini API quota pre-control.
+Prevents ResourceExhausted (429) by throttling requests before they reach the API.
+
+Quota reference (us-central1 / global endpoint, as of 2025):
+  gemini-2.5-flash: 1,000 RPM / 4,000,000 TPM
+  gemini-2.5-pro:   360 RPM / 2,000,000 TPM
+Verify current limits: https://cloud.google.com/vertex-ai/generative-ai/docs/quotas
+"""
+import os
+import time
+import threading
+import logging
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TokenBucket:
+    """
+    Thread-safe token bucket for rate limiting.
+    capacity:     Max burst size (tokens)
+    refill_rate:  Tokens added per second
+    """
+    capacity: float
+    refill_rate: float        # tokens per second
+    _tokens: float = field(init=False)
+    _last_refill: float = field(init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+
+    def __post_init__(self):
+        self._tokens = self.capacity
+        self._last_refill = time.monotonic()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self.capacity, self._tokens + elapsed * self.refill_rate)
+        self._last_refill = now
+
+    def consume(self, tokens: float = 1.0, timeout: float = 30.0) -> bool:
+        """
+        Blocks until `tokens` are available or `timeout` seconds have elapsed.
+        Returns True if tokens were consumed, False if timed out.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                self._refill()
+                if self._tokens >= tokens:
+                    self._tokens -= tokens
+                    return True
+            # Not enough tokens yet — wait and retry
+            wait = tokens / self.refill_rate
+            time.sleep(min(wait, deadline - time.monotonic()))
+        logger.warning(
+            "Rate limiter timeout after %.1fs waiting for %.0f tokens",
+            timeout, tokens,
+        )
+        return False
+
+
+# ─── Global rate limiter singletons ─────────────────────────────────────────
+# Adjust these to match your project's actual quota allocation.
+# If multiple services share quota, set a fraction of the total here.
+
+_FLASH_RPM  = float(os.environ.get("RATE_LIMIT_FLASH_RPM",  "600"))   # default: 60% of 1,000 RPM
+_PRO_RPM    = float(os.environ.get("RATE_LIMIT_PRO_RPM",    "200"))   # default: ~55% of 360 RPM
+
+flash_limiter = TokenBucket(
+    capacity=min(_FLASH_RPM / 10, 20),   # burst: up to 20 requests
+    refill_rate=_FLASH_RPM / 60,         # RPM → requests per second
+)
+
+pro_limiter = TokenBucket(
+    capacity=min(_PRO_RPM / 10, 10),
+    refill_rate=_PRO_RPM / 60,
+)
+
+
+def acquire_flash_quota(timeout: float = 30.0) -> bool:
+    """Acquires a rate-limit token for a gemini-2.5-flash call. Blocks if throttled."""
+    return flash_limiter.consume(1.0, timeout=timeout)
+
+
+def acquire_pro_quota(timeout: float = 60.0) -> bool:
+    """Acquires a rate-limit token for a gemini-2.5-pro call. Blocks if throttled."""
+    return pro_limiter.consume(1.0, timeout=timeout)
+```
+
+### Wrapping ModelHarness with Rate Limiting
+
+```python
+# agents/harness.py — add rate limiting before every model call
+from tools.rate_limiter import acquire_flash_quota, acquire_pro_quota
+from google.api_core import exceptions as gcp_exceptions
+
+
+class ModelHarness:
+    def generate(self, prompt: str, system_instruction: str = None) -> AgentResponse:
+        # Pre-control: acquire quota token before calling the API
+        model_tier = "pro" if "pro" in self.model_id else "flash"
+        acquired = (
+            acquire_pro_quota() if model_tier == "pro" else acquire_flash_quota()
+        )
+        if not acquired:
+            raise gcp_exceptions.ResourceExhausted(
+                "Rate limiter timeout — quota pre-control rejected the request."
+            )
+
+        # Proceed with the API call
+        resp = self.client.models.generate_content(...)
+        return resp.parsed
+```
+
+### Wrapping the `before_model_callback`
+
+For ADK agents that bypass `ModelHarness`, apply rate limiting in the callback:
+
+```python
+# agents/callbacks.py — rate limiting in before_model_callback
+from tools.rate_limiter import acquire_flash_quota
+
+def before_model_callback(callback_context, llm_request):
+    """Rate limit + Model Armor before every LLM call."""
+    # Throttle if near quota limit
+    if not acquire_flash_quota(timeout=20.0):
+        from google.adk.models.llm_response import LlmResponse
+        from google.genai import types
+        return LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[types.Part(text="[Rate limited — quota pre-control. Retry later.]")],
+            )
+        )
+    # Model Armor check (see §7 in adk_patterns.md)
+    return None
+```
+
+### Environment Variables
+
+```bash
+# agents/.env — tune to your project's actual quota allocation
+RATE_LIMIT_FLASH_RPM=600    # 60% of 1,000 RPM (leaves headroom for bursts)
+RATE_LIMIT_PRO_RPM=200      # ~55% of 360 RPM
+```
+
+Add to `infra/main.tf` deployment_spec:
+```hcl
+env {
+  name  = "RATE_LIMIT_FLASH_RPM"
+  value = var.rate_limit_flash_rpm
+}
+env {
+  name  = "RATE_LIMIT_PRO_RPM"
+  value = var.rate_limit_pro_rpm
+}
+```
+
+### Rate Limiting Checklist
+
+- [ ] `tools/rate_limiter.py` created with `TokenBucket`, `flash_limiter`, `pro_limiter`
+- [ ] `RATE_LIMIT_FLASH_RPM` / `RATE_LIMIT_PRO_RPM` in `agents/.env` and `infra/main.tf`
+- [ ] `acquire_flash_quota()` called in `ModelHarness.generate()` before the API call
+- [ ] `acquire_flash_quota()` called in `before_model_callback` for ADK agents
+- [ ] Monitor `ResourceExhausted` errors in Cloud Logging — reduce RPM limits if spikes persist
+- [ ] For Cloud Run scaled-out deployments: set limits per **instance** (not total) to avoid over-throttling
 - [ ] Regularly check per-session token usage with the `observability` extension
