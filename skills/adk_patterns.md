@@ -10,7 +10,7 @@ All agent code lives in the `agents/` directory. The `root_agent` variable is th
 
 ### Basic Structure
 ```python
-from google.adk.agents import Agent, SequentialAgent, LoopAgent
+from google.adk.agents import Agent, SequentialAgent, LoopAgent, ParallelAgent
 from google.adk.tools import ToolContext
 
 agent = Agent(
@@ -177,12 +177,13 @@ from tools.model_armor import sanitize_prompt, sanitize_response
 from google.genai import types
 
 
-def before_model_callback(
+async def before_model_callback(
     callback_context: CallbackContext,
     llm_request: LlmRequest,
 ) -> LlmResponse | None:
     """
     Runs before every model call on the agent.
+    Must be `async def` — ADK invokes callbacks as coroutines.
     Returns None to allow the call, or a synthetic LlmResponse to skip it.
 
     Use cases:
@@ -211,12 +212,13 @@ def before_model_callback(
     return None
 
 
-def after_model_callback(
+async def after_model_callback(
     callback_context: CallbackContext,
     llm_response: LlmResponse,
 ) -> LlmResponse | None:
     """
     Runs after every model call on the agent.
+    Must be `async def` — ADK invokes callbacks as coroutines.
     Returns None to use the original response, or a modified LlmResponse.
 
     Use cases:
@@ -336,7 +338,7 @@ sources:
   agent-state-db:
     kind: alloydb-postgres           # or cloud-sql-postgres, bigquery, etc.
     project: ${GOOGLE_CLOUD_PROJECT}
-    region: us-central1
+    region: ${REGION}                # infra deployment region — set REGION=us-central1 in agents/.env
     cluster: agent-harness-cluster
     instance: agent-harness-instance
     database: harness_db
@@ -674,7 +676,7 @@ async def _get_id_token(audience: str) -> str:
     import google.oauth2.id_token
     import google.auth.transport.requests
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()  # get_event_loop() raises DeprecationWarning in Python 3.10+
     auth_req = google.auth.transport.requests.Request()
     token = await loop.run_in_executor(
         None,
@@ -1016,7 +1018,7 @@ Enterprise Agent Harness — complete orchestration file.
 Wraps the Planner(Pro) → Worker(Flash) → Checker pipeline
 in a LoopAgent (Ralph Loop).
 """
-from google.adk.agents import Agent, SequentialAgent, LoopAgent
+from google.adk.agents import Agent, SequentialAgent, LoopAgent, ParallelAgent
 from google.adk.tools import ToolContext
 
 # Tool imports
@@ -1211,7 +1213,7 @@ async def main():
         new_message=message,
     ):
         # Each event is one step in the agent's reasoning
-        if event.is_final_response():
+        if event.is_final_response() and event.content and event.content.parts:
             print(f"\n[Final Response]\n{event.content.parts[0].text}")
         elif event.content:
             author = event.author or "agent"
@@ -1281,7 +1283,7 @@ if __name__ == "__main__":
 ```python
 async for event in runner.run_async(...):
     # Final agent response to the user
-    if event.is_final_response():
+    if event.is_final_response() and event.content and event.content.parts:
         response_text = event.content.parts[0].text
 
     # Intermediate tool call (agent decided to use a tool)
@@ -1310,7 +1312,6 @@ from google.genai.types import Content, Part
 from agents.agent import root_agent
 
 
-@pytest.mark.asyncio
 async def test_agent_refuses_destructive_command():
     """Verify the agent refuses rm -rf via Policy Engine."""
     runner = InMemoryRunner(agent=root_agent, app_name="test")
@@ -1331,7 +1332,6 @@ async def test_agent_refuses_destructive_command():
     assert any(kw in response_text for kw in ["cannot", "policy", "not allowed", "blocked"])
 
 
-@pytest.mark.asyncio
 async def test_agent_produces_structured_output():
     """Verify the agent returns analysis, thought_process, next_steps."""
     runner = InMemoryRunner(agent=root_agent, app_name="test")
@@ -1411,6 +1411,10 @@ def request_human_approval(
         Status message — the loop will be escalated after this call
     """
     # Persist the pending approval in State so the next session can inspect it
+    # NOTE: state["session:id"] is NOT set automatically by ADK. You must populate it
+    # explicitly before invoking the agent, e.g. in a before_agent_callback or
+    # in the code that calls runner.run_async():
+    #   session_state["session:id"] = session.id
     tool_context.state["pending_approval"] = {
         "action":     action,
         "reason":     reason,
@@ -1465,7 +1469,13 @@ def check_approval_status(session_id: str, tool_context: ToolContext) -> dict:
 
 
 def _send_approval_notification(action: str, reason: str, risk_level: str) -> None:
-    """Sends a webhook notification to operators (Slack, PagerDuty, etc.)."""
+    """Sends a webhook notification to operators (Slack, PagerDuty, etc.).
+
+    Sync httpx.post() is intentional: this is a sync function, and ADK automatically
+    runs sync tools in a thread pool executor, so blocking here does not affect the
+    asyncio event loop. If you need async, replace with `httpx.AsyncClient` and make
+    this function `async`.
+    """
     if not APPROVAL_WEBHOOK_URL:
         logger.warning("APPROVAL_WEBHOOK_URL not set — skipping notification")
         return
@@ -1551,6 +1561,7 @@ APPROVAL_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
 - [ ] `APPROVAL_WEBHOOK_URL` set in `agents/.env` and `infra/main.tf` deployment_spec
 - [ ] `request_human_approval` and `check_approval_status` registered on the Checker agent
 - [ ] `WORKER_INSTRUCTION` includes the High-Risk Action Rule
+- [ ] `state["session:id"]` explicitly set before `runner.run_async()` — ADK does not populate this automatically
 - [ ] `pending_approval.status` updated externally (dashboard or API) before re-triggering
 - [ ] `state["pending_approval"]["status"]` = `"approved"` or `"rejected"` on resume
 

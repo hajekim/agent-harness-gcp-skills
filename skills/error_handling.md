@@ -61,12 +61,12 @@ def with_retry(max_attempts: int = 3, backoff_seconds: float = 2.0):
                     last_error = e
                     wait = backoff_seconds * (2 ** (attempt - 1))
                     logger.warning(
-                        f"[{func.__name__}] attempt {attempt}/{max_attempts} failed: {e}. "
-                        f"Retrying in {wait:.1f}s..."
+                        "[%s] attempt %d/%d failed: %s. Retrying in %.1fs...",
+                        func.__name__, attempt, max_attempts, e, wait,
                     )
                     if attempt < max_attempts:
                         time.sleep(wait)
-            logger.error(f"[{func.__name__}] all {max_attempts} attempts failed.")
+            logger.error("[%s] all %d attempts failed.", func.__name__, max_attempts)
             raise last_error
         return wrapper
     return decorator
@@ -94,12 +94,12 @@ def async_with_retry(max_attempts: int = 3, backoff_seconds: float = 2.0):
                     last_error = e
                     wait = backoff_seconds * (2 ** (attempt - 1))
                     logger.warning(
-                        f"[{func.__name__}] attempt {attempt}/{max_attempts} failed: {e}. "
-                        f"Retrying in {wait:.1f}s..."
+                        "[%s] attempt %d/%d failed: %s. Retrying in %.1fs...",
+                        func.__name__, attempt, max_attempts, e, wait,
                     )
                     if attempt < max_attempts:
                         await asyncio.sleep(wait)   # non-blocking sleep
-            logger.error(f"[{func.__name__}] all {max_attempts} attempts failed.")
+            logger.error("[%s] all %d attempts failed.", func.__name__, max_attempts)
             raise last_error
         return wrapper
     return decorator
@@ -141,6 +141,7 @@ When a Remote MCP server is down, the agent should degrade gracefully rather tha
 ```python
 # tools/mcp_client.py
 import asyncio
+import threading
 import time
 from enum import Enum
 
@@ -150,32 +151,43 @@ class CircuitState(Enum):
     HALF_OPEN = "half_open" # testing recovery
 
 class MCPCircuitBreaker:
+    """Thread-safe circuit breaker for Remote MCP server calls.
+
+    Uses threading.Lock to protect shared state (failure_count, last_failure_time,
+    state) from concurrent access — critical when ParallelAgent or asyncio tasks
+    call multiple MCP tools simultaneously in the same process.
+    """
+
     def __init__(self, failure_threshold: int = 3, recovery_timeout: float = 30.0):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.failure_count = 0
         self.last_failure_time: float = 0.0
         self.state = CircuitState.CLOSED
+        self._lock = threading.Lock()   # guards all mutable state
 
     def call_allowed(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
-        if self.state == CircuitState.OPEN:
-            if time.time() - self.last_failure_time > self.recovery_timeout:
-                self.state = CircuitState.HALF_OPEN
+        with self._lock:
+            if self.state == CircuitState.CLOSED:
                 return True
-            return False
-        return True  # HALF_OPEN — allow one probe
+            if self.state == CircuitState.OPEN:
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self.state = CircuitState.HALF_OPEN
+                    return True
+                return False
+            return True  # HALF_OPEN — allow one probe
 
     def record_success(self):
-        self.failure_count = 0
-        self.state = CircuitState.CLOSED
+        with self._lock:
+            self.failure_count = 0
+            self.state = CircuitState.CLOSED
 
     def record_failure(self):
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.failure_count >= self.failure_threshold:
-            self.state = CircuitState.OPEN
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.failure_count >= self.failure_threshold:
+                self.state = CircuitState.OPEN
 
 # Global circuit breaker instance per MCP server
 _circuit = MCPCircuitBreaker(failure_threshold=3, recovery_timeout=30.0)
@@ -393,7 +405,7 @@ gemini extensions install https://github.com/gemini-cli-extensions/security
 
 ## 8. Error Handling Checklist
 
-- [ ] All tool functions use `@with_retry` for transient errors
+- [ ] Sync tool functions use `@with_retry`; async tool functions use `@async_with_retry` (see §2 — never apply `@with_retry` to an async def)
 - [ ] `PermissionError` from Policy Engine is never retried
 - [ ] MCP client uses circuit breaker pattern
 - [ ] Worker writes structured JSON to `state['execution_result']` (status + error fields)
@@ -430,9 +442,12 @@ from google.adk.tools import ToolContext
 SESSION_TOKEN_BUDGET = int(os.environ.get("SESSION_TOKEN_BUDGET", "100000"))
 
 # Input token price (USD / 1K tokens) — see cloud.google.com/vertex-ai/pricing
+# Verify current pricing before production use; rates change with model releases.
 _COST_PER_1K_INPUT = {
-    "gemini-3-flash-preview": 0.000075,   # $0.075 / 1M tokens
-    "gemini-3-pro-preview":   0.00125,    # $1.25  / 1M tokens
+    "gemini-2.5-flash":       0.000075,   # $0.075 / 1M tokens (stable — ModelHarness default)
+    "gemini-2.5-pro":         0.00125,    # $1.25  / 1M tokens (stable)
+    "gemini-3-flash-preview": 0.000075,   # $0.075 / 1M tokens (preview)
+    "gemini-3-pro-preview":   0.00125,    # $1.25  / 1M tokens (preview)
 }
 
 
@@ -703,8 +718,10 @@ tracer = setup_tracing()
 ```python
 # tools/grounding.py (example — apply the same pattern to other tools)
 from agents.observability import logger, tracer
+from google.adk.tools import ToolContext
+from opentelemetry.trace import Status, StatusCode
 
-def search_knowledge_base(query: str, tool_context) -> list[str]:
+def search_knowledge_base(query: str, tool_context: ToolContext) -> str:
     session_id = tool_context.state.get("session:id", "unknown")
 
     with tracer.start_as_current_span("search_knowledge_base") as span:
@@ -716,16 +733,16 @@ def search_knowledge_base(query: str, tool_context) -> list[str]:
             extra={"extra_fields": {"session_id": session_id, "query": query[:100]}},
         )
         try:
-            results = _do_search(query)          # actual search logic
-            span.set_attribute("result_count", len(results))
+            result = _do_search(query)           # actual search logic — returns str
+            span.set_attribute("result_length", len(result))
             logger.info(
                 "Knowledge base search completed",
-                extra={"extra_fields": {"session_id": session_id, "hits": len(results)}},
+                extra={"extra_fields": {"session_id": session_id, "result_length": len(result)}},
             )
-            return results
+            return result
         except Exception as exc:
             span.record_exception(exc)
-            span.set_status(trace.StatusCode.ERROR, str(exc))
+            span.set_status(Status(StatusCode.ERROR, str(exc)))
             logger.error(
                 "Knowledge base search failed",
                 extra={"extra_fields": {"session_id": session_id, "error": str(exc)}},
@@ -754,8 +771,11 @@ from opentelemetry import trace as otel_trace
 _active_spans: dict[str, Any] = {}
 
 
-def before_model_callback(callback_context, llm_request):
-    """Model Armor input check + start iteration trace span."""
+async def before_model_callback(callback_context, llm_request):
+    """Model Armor input check + start iteration trace span.
+
+    Must be `async def` — ADK invokes callbacks as coroutines.
+    """
     session_id = callback_context.state.get("session:id", "unknown")
     iteration  = callback_context.state.get("session:iteration", 0)
 
@@ -778,8 +798,11 @@ def before_model_callback(callback_context, llm_request):
     return None
 
 
-def after_model_callback(callback_context, llm_response):
-    """Model Armor output check + explicitly end the trace span."""
+async def after_model_callback(callback_context, llm_response):
+    """Model Armor output check + explicitly end the trace span.
+
+    Must be `async def` — ADK invokes callbacks as coroutines.
+    """
     session_id = callback_context.state.get("session:id", "unknown")
     span_key = f"{session_id}.{callback_context.agent_name}"
 
@@ -908,6 +931,13 @@ class TokenBucket:
         """
         Blocks until `tokens` are available or `timeout` seconds have elapsed.
         Returns True if tokens were consumed, False if timed out.
+
+        ⚠️  asyncio WARNING: `time.sleep()` blocks the calling thread. If called from
+        an async ADK tool, this will block the asyncio event loop and prevent other
+        coroutines from running. To avoid this:
+          - Use this rate limiter only in **sync** tool functions, OR
+          - In async tools, run it in a thread: `await asyncio.to_thread(limiter.consume, ...)`
+        ADK automatically runs sync tools in a thread pool, so sync tools are safe.
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -987,8 +1017,11 @@ For ADK agents that bypass `ModelHarness`, apply rate limiting in the callback:
 # agents/callbacks.py — rate limiting in before_model_callback
 from tools.rate_limiter import acquire_flash_quota
 
-def before_model_callback(callback_context, llm_request):
-    """Rate limit + Model Armor before every LLM call."""
+async def before_model_callback(callback_context, llm_request):
+    """Rate limit + Model Armor before every LLM call.
+
+    Must be `async def` — ADK invokes callbacks as coroutines.
+    """
     # Throttle if near quota limit
     if not acquire_flash_quota(timeout=20.0):
         from google.adk.models.llm_response import LlmResponse

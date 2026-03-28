@@ -8,7 +8,7 @@ Use it to understand why specific design decisions were made and what has change
 ## Current State (as of 2026-03-28)
 
 **Repository**: https://github.com/hajekim/agent-harness-gcp-skills
-**Status**: Stable — all planned improvements complete
+**Status**: Stable — Round 15 validation complete
 **Skill files**: 8 skill files + 1 trigger file (`skills/TRIGGERS.md`)
 
 ---
@@ -179,6 +179,88 @@ Added:
 
 ---
 
+### Round 13 — Gemini 3 Model ID Validation & Code Correctness
+**Session**: 2026-03-28
+
+#### 1. Gemini 3 Model IDs (adk_patterns.md §8)
+**Why**: Previous session had labeled `gemini-3-flash-preview` / `gemini-3-pro-preview` as "conceptual placeholders." User confirmed these are real production/preview model IDs.
+
+Changed:
+- Removed "conceptual placeholder" disclaimer
+- Added production vs. preview guidance table (stable: `gemini-2.5-*`, preview: `gemini-3-*`)
+
+#### 2. MCP SDK Mock Fix (evaluation.md §9)
+**Why**: Tests mocked `MCPToolboxClient` which does not exist in the MCP Python SDK. Actual pattern is `sse_client` + `ClientSession`.
+
+Changed:
+- `TestStateTool` rewrote both tests to mock `sse_client` transport and `ClientSession.call_tool()`
+
+#### 3. OTel Span Lifecycle (error_handling.md §10)
+**Why**: `otel_trace.use_span(span)` returns a context manager — not JSON-serializable. Cannot store in ADK State.
+
+Changed:
+- Module-level `_active_spans: dict` with explicit `span.end()` in `after_model_callback`
+
+#### 4. pyproject.toml build-backend (gcp_setup.md §7)
+**Why**: `setuptools.backends.legacy:build` doesn't exist — correct value is `setuptools.build_meta`.
+
+Changed: `build-backend = "setuptools.backends.legacy:build"` → `build-backend = "setuptools.build_meta"`
+
+#### 5. run_loop() Bug Fixes (memory_and_state.md §3)
+**Why**: IndexError if `current_task_index >= len(tasks)` on rehydrate; `last_result` was never set from runner output.
+
+Added: bounds check guard + documentation comment on how to extract result from ADK runner output.
+
+#### 6. Library Validation Before Implementation
+**Why**: User requested: verify all referenced libraries are current and not deprecated before applying changes.
+
+Validated via context7 MCP:
+- ADK Python: `sse_client` + `ClientSession` confirmed; `MCPToolboxClient` confirmed non-existent
+- OpenTelemetry: `use_span()` requires context manager or explicit `span.end()` confirmed
+- `asyncio.get_event_loop()`: deprecated in Python 3.10+, raises RuntimeError in 3.12
+
+---
+
+### Round 14 — Production Correctness (18 Issues Fixed)
+**Session**: 2026-03-28
+
+Full pass over all skill files found 18 issues: 6 high, 7 medium, 5 low.
+
+#### High Priority (6 fixes)
+
+| ID | File | Fix |
+|----|------|-----|
+| H-1 | `evaluation.md §9` | Removed `@pytest.mark.asyncio` from `TestStateTool` — contradicts `asyncio_mode = "auto"` in pyproject.toml |
+| H-2 | `adk_patterns.md §11` | `asyncio.get_event_loop()` → `asyncio.get_running_loop()` (deprecated Python 3.10+) |
+| H-3 | `adk_patterns.md §15` | Added explicit docstring explaining sync `httpx.post()` is intentional — ADK runs sync tools in thread pool |
+| H-4 | `ralph_loop_gcp.md §9` | `mark_task_done()`: line-by-line `strip()` replace instead of raw string replace — fixes whitespace fragility |
+| H-5 | `gcp_setup.md §2` | Added `vpcaccess.googleapis.com` + `servicenetworking.googleapis.com` to API enable list + table |
+| H-6 | `gcp_setup.md §3` | Added `roles/run.invoker` IAM role + updated IAM Role Summary table |
+
+#### Medium Priority (7 fixes)
+
+| ID | File | Fix |
+|----|------|-----|
+| M-1 | `TRIGGERS.md` | Added triggers for §14 Runner, §15 HitL, §16 ParallelAgent, Rollback, VPC, Rate Limiting |
+| M-2 | `memory_and_state.md §2` | Added SDK version verification note for `generate_memories()` API |
+| M-3 | `adk_patterns.md §15` | Added note that `state["session:id"]` must be set explicitly; added to HitL checklist |
+| M-4 | `ralph_loop_gcp.md §9` | `--oauth-service-account-email` → `--oidc-service-account-email` |
+| M-5 | `error_handling.md §11` | Added `time.sleep()` asyncio event loop blocking warning to `TokenBucket.consume()` |
+| M-6 | `infra_and_cicd.md §7` | "CI/CD (Method C) Checklist" → "CI/CD Pipeline (Cloud Build) Checklist" |
+| M-7 | `adk_patterns.md §13` | Added `ParallelAgent` to imports in complete `agent.py` assembly |
+
+#### Low Priority (5 fixes)
+
+| ID | File | Fix |
+|----|------|-----|
+| L-1 | `gcp_setup.md §10` | Strengthened `GOOGLE_APPLICATION_CREDENTIALS` security warning (key file risk, Workload Identity alternative) |
+| L-2 | `agent_harness_gcp.md §5` | Principle 4: ZDR target corrected — ADK State/AlloyDB/GCS (not Memory Bank; Memory Bank is cross-session knowledge) |
+| L-3 | `error_handling.md §8` | Updated `@with_retry` checklist entry to distinguish sync (`@with_retry`) vs async (`@async_with_retry`) |
+| L-4 | `ralph_loop_gcp.md §9` | Added comment: `hash(task)` is non-deterministic across processes — use `hashlib.md5` for stable session IDs |
+| L-5 | `gcp_setup.md §10` | Added `SRE_AGENT_URL` / `ARCH_AGENT_URL` to variable-to-skill cross-reference table |
+
+---
+
 ## Key Design Decisions
 
 ### Region Decoupling
@@ -203,14 +285,47 @@ Secret Manager versions are disabled (not deleted) after rotation. Disabled vers
 
 ## Trigger Coverage (TRIGGERS.md)
 
-~297 triggers total across 9 skill categories:
-- **English**: ~149 triggers (noun-form, question, intent, problem-based, comparison, keyword-style, beginner)
-- **Korean**: ~148 triggers (noun형, 질문형, 대화형, 문제-기반, 의도형)
+~330 triggers total across 9 skill categories (increased from ~297 in Round 13 after adding triggers for new sections):
+- **English**: ~165 triggers (noun-form, question, intent, problem-based, comparison, keyword-style, beginner)
+- **Korean**: ~165 triggers (noun형, 질문형, 대화형, 문제-기반, 의도형)
+
+New trigger topics added in Round 14: ADK Runner, HitL approval gate, ParallelAgent, rollback strategy, VPC Private Access, rate limiting (quota pre-control).
+
+---
+
+### Round 15 — Validation & Bug Fixes (2 Confirmed Bugs Fixed)
+**Session**: 2026-03-28
+
+Full validation pass against ADK, opentelemetry-sdk, google-cloud-trace, and python-genai official documentation. Found 2 confirmed bugs and 6 unverified items.
+
+#### Confirmed Bugs Fixed (2)
+
+| ID | File | Bug | Fix |
+|----|------|-----|-----|
+| E1 | `error_handling.md §10` | `def before_model_callback` / `def after_model_callback` (sync) — ADK invokes callbacks as coroutines | Changed all 3 callback definitions to `async def`; added docstring note "Must be `async def`" |
+| E2 | `error_handling.md §10` | `span.set_status(trace.StatusCode.ERROR, str(exc))` — wrong OTel API signature | Fixed to `span.set_status(Status(StatusCode.ERROR, str(exc)))` with `from opentelemetry.trace import Status, StatusCode` import |
+
+#### Unverified Items (6) — Notes Added
+
+| ID | Location | Item | Status |
+|----|----------|------|--------|
+| U1 | `adk_patterns.md §15` | `tool_context.actions.escalate = True` — may differ from official `exit_loop` mechanism | Documented; verify against ADK HitL samples |
+| U2 | multiple | `gemini-3-flash-preview` / `gemini-3-pro-preview` model IDs | User confirmed as real preview IDs |
+| U3 | `error_handling.md §10` | `callback_context.agent_name` attribute | Verify against ADK `CallbackContext` API |
+| U4 | `memory_and_state.md §2` | `MemoryBank.add_memories()` messages parameter format | Verify against Vertex AI Memory Bank API |
+| U5 | `error_handling.md §11` | `NotificationRateLimit(period={"seconds": 3600})` dict Duration | Verify against Cloud Monitoring protobuf API |
+| U6 | `adk_patterns.md §14` | `event.get_function_calls()`, `event.get_function_responses()` | Verify against ADK Event API |
 
 ---
 
 ## Pending / Known Limitations
 
-- Model IDs (`gemini-2.5-flash`, `gemini-2.5-pro`) are current as of 2026-03 — verify with `gcloud ai models list --region=global` before production deployment
-- Agent Engine Memory Bank provisioning (`infra/memory_bank_config.py`) is not yet in the Terraform module — documented in `memory_and_state.md` but requires manual run
-- VPC Private Access Terraform module (`infra/vpc.tf`) is a reference pattern, not part of the base `infra/main.tf`
+- Model IDs (`gemini-2.5-flash`, `gemini-2.5-pro`) are stable defaults; `gemini-3-flash-preview` / `gemini-3-pro-preview` are preview IDs. Verify with `gcloud ai models list --region=global` before production deployment.
+- `generate_memories()` API in `memory_and_state.md §2` is in `vertexai.preview` — method signature may change on SDK updates. Check Vertex AI release notes before upgrading.
+- Agent Engine Memory Bank provisioning (`infra/memory_bank_config.py`) is not yet in the Terraform module — documented in `memory_and_state.md` but requires manual run.
+- VPC Private Access Terraform module (`infra/vpc.tf`) is a reference pattern, not part of the base `infra/main.tf`.
+- `TokenBucket.consume()` uses `time.sleep()` — safe only in sync ADK tools (ADK runs them in thread pool). Async tools must use `asyncio.to_thread(limiter.consume, ...)` to avoid event loop blocking.
+- U3: `callback_context.agent_name` — verify attribute name against ADK `CallbackContext` class before production use.
+- U4: `MemoryBank.add_memories()` messages format — verify against Vertex AI Memory Bank API docs.
+- U5: `NotificationRateLimit(period={"seconds": 3600})` — verify dict-style Duration is accepted by Cloud Monitoring protobuf.
+- U6: `event.get_function_calls()` / `event.get_function_responses()` — verify these are ADK Event methods (not attributes).

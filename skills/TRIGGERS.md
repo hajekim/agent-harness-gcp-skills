@@ -75,6 +75,13 @@ AI agents (Gemini CLI, Claude Code) should load the corresponding skill when a u
 - "My callback isn't being triggered"
 - "adk tool function example"
 - "which gemini model id to use"
+- "How do I run an ADK agent with Runner?"
+- "What is InMemoryRunner in ADK?"
+- "How do I implement human-in-the-loop approval?"
+- "Pause the agent loop for human approval"
+- "How do I run agents in parallel?"
+- "ParallelAgent fan-out fan-in pattern"
+- "How do I run multiple agents at the same time?"
 
 **Korean triggers**
 - "ADK 에이전트 정의 방법"
@@ -99,6 +106,11 @@ AI agents (Gemini CLI, Claude Code) should load the corresponding skill when a u
 - "콜백 함수 언제 어떻게 써요?"
 - "어떤 Gemini 모델 ID 써야 해요?"
 - "Gemini 호출할 때 리전을 global로 해야 하나요?"
+- "ADK Runner 어떻게 써요?"
+- "사람이 개입하는 승인 게이트 어떻게 구현해요?"
+- "에이전트 루프를 승인 대기 상태로 멈추려면요?"
+- "에이전트 여러 개를 동시에 실행하려면요?"
+- "ParallelAgent 팬아웃 팬인 패턴"
 
 ---
 
@@ -267,6 +279,16 @@ AI agents (Gemini CLI, Claude Code) should load the corresponding skill when a u
 - "adk deploy 명령어 어떻게 써요?"
 - "Agent Engine이 왜 us-central1만 되나요?"
 - "프로덕션 배포 전에 뭐 확인해야 해요?"
+- "배포 실패 시 롤백 어떻게 해요?"
+- "Cloud Run을 VPC에서 프라이빗하게 실행하려면요?"
+- "VPC Private Access 설정 방법"
+
+**Additional English triggers**
+- "How do I roll back an Agent Engine deployment?"
+- "Rollback strategy for Cloud Run"
+- "Set up VPC Private Access for Cloud Run"
+- "Connect Cloud Run to AlloyDB privately"
+- "Serverless VPC connector setup"
 
 ---
 
@@ -312,6 +334,15 @@ AI agents (Gemini CLI, Claude Code) should load the corresponding skill when a u
 - "모델이 응답을 거부했어요"
 - "프로덕션에서 에이전트 장애 어떻게 디버깅해요?"
 - "Flash랑 Pro 어떨 때 골라 써요?"
+- "Gemini API 할당량 초과(429) 어떻게 방지해요?"
+- "Rate Limiting 어떻게 구현해요?"
+- "토큰 버킷 rate limiter 구현"
+
+**Additional English triggers**
+- "How do I prevent ResourceExhausted 429 errors?"
+- "Implement rate limiting for Gemini API quota"
+- "Token bucket rate limiter for ADK agents"
+- "Pre-control quota before hitting the API"
 
 ---
 

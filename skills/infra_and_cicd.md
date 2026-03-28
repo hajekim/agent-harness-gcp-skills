@@ -188,7 +188,8 @@ adk deploy agent_engine agents/ \
   --display_name "harness-production" \
   --validate-agent-import
 
-# Deploy as Cloud Run service with development UI
+# Deploy as Cloud Run service with development UI (dev/staging only)
+# ⚠️ --with-ui bundles the ADK development UI — do NOT use in production deployments
 adk deploy cloud_run agents/ \
   --project $PROJECT_ID \
   --region $REGION \
@@ -533,7 +534,7 @@ git revert HEAD --no-edit && git push origin main  # triggers Cloud Build via br
 - [ ] `gcloud auth application-default login` completed
 - [ ] MCP server code tested locally before deploy
 
-### CI/CD (Method C) Checklist
+### CI/CD Pipeline (Cloud Build) Checklist
 - [ ] Cloud Build trigger created and linked to repository
 - [ ] `${PROJECT_ID}` substitution variable set in trigger
 - [ ] `eval/run_eval.py` returns exit code 0 on passing quality threshold

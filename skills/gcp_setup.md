@@ -58,6 +58,8 @@ gcloud services enable \
   modelarmor.googleapis.com \
   cloudscheduler.googleapis.com \
   discoveryengine.googleapis.com \
+  vpcaccess.googleapis.com \
+  servicenetworking.googleapis.com \
   --project=$PROJECT_ID
 ```
 
@@ -83,6 +85,8 @@ gemini "enable all APIs required for an Agent Harness on GCP: Vertex AI, Cloud R
 | `modelarmor.googleapis.com` | Model Armor input/output inspection (prompt injection defense) |
 | `cloudscheduler.googleapis.com` | External trigger for production Ralph Loop |
 | `discoveryengine.googleapis.com` | Vertex AI Search — required for RAG/Grounding (see `adk_patterns.md §10`) |
+| `vpcaccess.googleapis.com` | Serverless VPC connector — required for Cloud Run VPC private access (see `infra_and_cicd.md §8`) |
+| `servicenetworking.googleapis.com` | Private Service Access — required for AlloyDB PSA and VPC peering |
 
 ---
 
@@ -130,6 +134,12 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
   --member="serviceAccount:$SA_EMAIL" \
   --role="roles/storage.objectAdmin"
 
+# Cloud Run — invoke other Cloud Run services (A2A specialist agents, MCP servers)
+# Needed in addition to roles/run.developer when the SA calls Cloud Run endpoints via HTTP
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$SA_EMAIL" \
+  --role="roles/run.invoker"
+
 # Logging & Monitoring — write telemetry
 gcloud projects add-iam-policy-binding $PROJECT_ID \
   --member="serviceAccount:$SA_EMAIL" \
@@ -149,7 +159,8 @@ gemini "create a service account called agent-harness-sa and grant it the minimu
 | Role | Layer | Required For |
 |------|-------|-------------|
 | `roles/aiplatform.user` | 2, 3, 5 | Agent Engine, Gemini API, Memory Bank |
-| `roles/run.developer` | 2, 4 | Cloud Run deployment, MCP server invoke |
+| `roles/run.developer` | 2, 4 | Cloud Run deployment |
+| `roles/run.invoker` | 4, 11 | Invoke Cloud Run services — A2A agents, MCP servers |
 | `roles/cloudbuild.builds.editor` | 2 | CI/CD pipeline execution |
 | `roles/artifactregistry.writer` | 2 | Container image push |
 | `roles/secretmanager.secretAccessor` | 6 | Read credentials at runtime |
@@ -439,7 +450,11 @@ A single consolidated reference for every environment variable used across the A
 GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=global          # Gemini global endpoint — do NOT set to us-central1
 REGION=us-central1                    # Infrastructure deployment region (Cloud Run, AlloyDB, etc.)
-GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json  # Local dev only
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+# ⚠️  SECURITY: Service account JSON keys are long-lived credentials — a significant
+# security risk if leaked. NEVER commit this file or set it in production.
+# In production, use Workload Identity Federation or ADC via the metadata server.
+# For local dev, prefer: gcloud auth application-default login (no key file needed)
 
 # ── Agent Model ─────────────────────────────────────────────────────────
 AGENT_MODEL_ID=gemini-2.5-flash       # Override model without code changes (see adk_patterns.md §12)
@@ -494,6 +509,8 @@ LOG_LEVEL=INFO                        # DEBUG | INFO | WARNING | ERROR
 | `VERTEX_AI_SEARCH_DATASTORE` | §5 | `search_knowledge_base` | adk_patterns.md §10 |
 | `MODEL_ARMOR_TEMPLATE_ID` | §5 | `tools/model_armor.py` | agent_harness_gcp.md Layer 6 |
 | `MODEL_ARMOR_LOCATION` | §5 | `tools/model_armor.py` | agent_harness_gcp.md Layer 6 |
+| `SRE_AGENT_URL` | §10 | `tools/a2a_client.py` | adk_patterns.md §11 |
+| `ARCH_AGENT_URL` | §10 | `tools/a2a_client.py` | adk_patterns.md §11 |
 | `APPROVAL_WEBHOOK_URL` | §10 | `tools/approval_gate.py` | adk_patterns.md §15 |
 | `RATE_LIMIT_FLASH_RPM` | §10 | `tools/rate_limiter.py` | error_handling.md §11 |
 | `MCP_TOOLBOX_URL` | §10 | `tools/state_tools.py` | adk_patterns.md §9 |

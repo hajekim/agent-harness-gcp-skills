@@ -105,9 +105,12 @@ def evaluate_case(harness: ModelHarness, case: dict) -> dict:
     """Runs a single test case and scores the result."""
     start = time.time()
 
+    with open("prompts/system_instruction.txt") as f:
+        system_instruction = f.read()
+
     result = harness.generate_safe(
         prompt=case["input"],
-        system_instruction=open("prompts/system_instruction.txt").read(),
+        system_instruction=system_instruction,
     )
 
     latency = time.time() - start
@@ -593,7 +596,6 @@ from tools.state_tools import get_task_state, update_task_state
 
 class TestStateTool:
     @patch("tools.state_tools.sse_client")
-    @pytest.mark.asyncio
     async def test_get_task_state_calls_mcp(self, mock_sse_client, mock_tool_context):
         # Simulate: async with sse_client(...) as (read, write)
         mock_read, mock_write = AsyncMock(), AsyncMock()
@@ -619,7 +621,6 @@ class TestStateTool:
         )
 
     @patch("tools.state_tools.sse_client")
-    @pytest.mark.asyncio
     async def test_update_task_state_writes_status(self, mock_sse_client, mock_tool_context):
         mock_read, mock_write = AsyncMock(), AsyncMock()
         mock_sse_client.return_value.__aenter__.return_value = (mock_read, mock_write)

@@ -132,6 +132,9 @@ def search_memory(query: str, session_id: str, top_k: int = 5) -> list[str]:
     Inject results into the Worker agent's context via ADK State.
     """
     memory_bank = reasoning_engines.MemoryBank(MEMORY_BANK_ID)
+    # ⚠️  SDK note: `generate_memories()` method name and response shape may vary by SDK version.
+    # If this raises AttributeError, check the vertexai SDK release notes for MemoryBank API changes:
+    # https://cloud.google.com/vertex-ai/docs/release-notes
     results = memory_bank.generate_memories(
         user_id=session_id,
         query=query,

@@ -317,6 +317,9 @@ from vertexai import agent_engines   # GA path: vertexai>=1.71 (google-cloud-aip
 
 PROJECT_ID             = os.environ["GOOGLE_CLOUD_PROJECT"]
 LOCATION               = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")  # Gemini model endpoint — must be global
+# NOTE: LOCATION is not passed directly to agent_engines calls here.
+# Agent Engine SDK reads GOOGLE_CLOUD_LOCATION from the environment automatically
+# via the vertexai.init() / ADK runtime initialization.
 AGENT_ENGINE_ID        = os.environ["AGENT_ENGINE_ID"]
 EXTERNAL_MEMORY_BUCKET = os.environ["EXTERNAL_MEMORY_BUCKET"]  # GCS bucket name
 DEFINE_BLOB            = os.environ.get("DEFINE_BLOB", "agent-memory/DEFINE.md")
@@ -350,8 +353,14 @@ def read_pending_tasks() -> list[str]:
 def mark_task_done(task: str) -> None:
     """Marks the given task as complete (- [x]) in DEFINE.md in GCS."""
     content = _read_gcs(DEFINE_BLOB)
-    content = content.replace(f"- [ ] {task}", f"- [x] {task}", 1)
-    _write_gcs(DEFINE_BLOB, content)
+    # Line-by-line replace: strip() handles any leading indentation in DEFINE.md
+    lines = content.splitlines(keepends=True)
+    replaced = False
+    for i, line in enumerate(lines):
+        if line.strip() == f"- [ ] {task}" and not replaced:
+            lines[i] = line.replace("- [ ]", "- [x]", 1)
+            replaced = True
+    _write_gcs(DEFINE_BLOB, "".join(lines))
 
 
 def append_action_log(task: str, result: str) -> None:
@@ -374,6 +383,8 @@ def run_one_iteration(task: str) -> str:
     """
     # GA SDK: vertexai.agent_engines (vertexai.preview.reasoning_engines is deprecated)
     agent = agent_engines.get_reasoning_engine(AGENT_ENGINE_ID)
+    # WARNING: hash() is non-deterministic across processes (PYTHONHASHSEED).
+    # For a stable session ID, use: hashlib.md5(task.encode()).hexdigest()[:8]
     session_id = f"ralph-{abs(hash(task)):08x}"
     response = agent.query(input=task, session_id=session_id)
     return str(response)
@@ -476,7 +487,7 @@ gcloud scheduler jobs create http ralph-loop-trigger \
   --schedule="0 * * * *" \
   --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/ralph-outer-loop:run" \
   --message-body='{}' \
-  --oauth-service-account-email="agent-harness-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --oidc-service-account-email="agent-harness-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
   --project=$PROJECT_ID
 
 # Run Scheduler immediately (for testing)

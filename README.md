@@ -33,13 +33,13 @@ On Google Cloud, the harness is built from three layers:
 
 | Phase | File | Description |
 |-------|------|-------------|
-| **Prerequisites** | [`skills/gcp_setup.md`](skills/gcp_setup.md) | GCP API enablement, IAM, service accounts, gcloud auth, `pyproject.toml`, `requirements.txt` (including OpenTelemetry), local dev workflow (`adk web` / `adk run`) |
-| **Framework** | [`skills/adk_patterns.md`](skills/adk_patterns.md) | ADK agent definition, State scopes, orchestration patterns, tool authoring, MCP + genai-toolbox, Model Armor callbacks, RAG/Grounding, A2A protocol, ModelHarness, complete `agent.py` assembly reference, Gemini model ID guide |
+| **Prerequisites** | [`skills/gcp_setup.md`](skills/gcp_setup.md) | GCP API enablement, IAM (incl. `roles/run.invoker`), service accounts, gcloud auth, `pyproject.toml`, `requirements.txt`, Secret Manager rotation, local dev workflow |
+| **Framework** | [`skills/adk_patterns.md`](skills/adk_patterns.md) | ADK agent definition, State scopes, orchestration patterns, tool authoring, MCP + genai-toolbox, Model Armor callbacks, RAG/Grounding, A2A protocol, ModelHarness, complete `agent.py` assembly, Runner (`InMemoryRunner` + `DatabaseSessionService`), Human-in-the-Loop approval gate, ParallelAgent fan-out/fan-in |
 | **Architecture** | [`skills/agent_harness_gcp.md`](skills/agent_harness_gcp.md) | Full 8-layer GCP architecture, Model Armor integration, file-to-layer mapping, three-tier deployment strategy, Region Decoupling pattern |
 | **Autonomy** | [`skills/ralph_loop_gcp.md`](skills/ralph_loop_gcp.md) | Ralph Loop 5 principles, ZDR, backpressure, PolicyEngine singleton, GCS external memory, Cloud Run Job + Cloud Scheduler production outer loop |
 | **State** | [`skills/memory_and_state.md`](skills/memory_and_state.md) | Memory Bank API, DatabaseSessionService, ZDR deep dive, genai-toolbox DB state tools, memory architecture decision tree |
-| **Infrastructure** | [`skills/infra_and_cicd.md`](skills/infra_and_cicd.md) | Terraform IaC (with Agent Engine us-central1 validation), `package_for_terraform.sh`, three deployment methods, Cloud Build eval-gate pipeline |
-| **Reliability** | [`skills/error_handling.md`](skills/error_handling.md) | Failure taxonomy, retry/backoff, circuit breaker, error propagation, token/cost management, structured logging + Cloud Trace (`agents/observability.py`) |
+| **Infrastructure** | [`skills/infra_and_cicd.md`](skills/infra_and_cicd.md) | Terraform IaC (with Agent Engine us-central1 validation), `package_for_terraform.sh`, three deployment methods, Cloud Build eval-gate pipeline, rollback strategy, VPC Private Access |
+| **Reliability** | [`skills/error_handling.md`](skills/error_handling.md) | Failure taxonomy, retry/backoff (sync + async), circuit breaker, error propagation, token/cost management, structured logging + Cloud Trace, rate limiting (token bucket quota pre-control) |
 | **Quality** | [`skills/evaluation.md`](skills/evaluation.md) | Golden dataset structure, eval runner, eval-gate CI/CD, unit test patterns (`ToolContext` mock, `conftest.py`, `pytest-asyncio`), code-review + security integration |
 | **Triggers** | [`skills/TRIGGERS.md`](skills/TRIGGERS.md) | English and Korean trigger phrases mapped to each skill file — for AI agent skill routing |
 

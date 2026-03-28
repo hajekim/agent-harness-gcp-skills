@@ -456,7 +456,7 @@ Agents in this project follow four principles:
 1. **Fact-based**: Respond only based on provided context and tool results
 2. **Safety first**: Refuse destructive operations and escalate to the Policy Engine
 3. **Efficiency**: Minimize unnecessary reasoning; use Gemini Thinking at the appropriate level
-4. **Resilience (ZDR)**: Record all critical intermediate state to Memory Bank
+4. **Resilience (ZDR)**: Record all critical intermediate state after every iteration — to ADK State (session), AlloyDB (production), or GCS (Cloud Run Jobs). Memory Bank is for long-term cross-session knowledge, not ZDR checkpoints.
 
 ---
 
